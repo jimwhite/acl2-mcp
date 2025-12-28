@@ -1,6 +1,7 @@
 """ACL2 MCP Server implementation."""
 
 import asyncio
+import logging
 import os
 import re
 import signal
@@ -15,6 +16,17 @@ from dataclasses import dataclass, field
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
+
+# Set up file logging for debugging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('/tmp/acl2-mcp-debug.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
 # Security constants
@@ -345,11 +357,23 @@ class SessionManager:
         session_id = str(uuid.uuid4())
 
         try:
+            # Pass through environment variables, especially ACL2_SYSTEM_BOOKS
+            env = os.environ.copy()
+            
+            # TODO: Don't hardcode path - should come from env var configured in devcontainer
+            # Check if ACL2_SYSTEM_BOOKS is set, if not try to detect or fail gracefully
+            if 'ACL2_SYSTEM_BOOKS' not in env:
+                logger.warning("ACL2_SYSTEM_BOOKS not set in environment for session, using fallback")
+                env['ACL2_SYSTEM_BOOKS'] = '/home/acl2/books'
+            
+            logger.debug(f"Starting ACL2 session with ACL2_SYSTEM_BOOKS={env.get('ACL2_SYSTEM_BOOKS')}")
+            
             process = await asyncio.create_subprocess_exec(
                 "acl2",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
 
             session = ACL2Session(
@@ -807,13 +831,14 @@ async def list_tools() -> list[Tool]:
     ]
 
 
-async def run_acl2(code: str, timeout: int = 30) -> str:
+async def run_acl2(code: str, timeout: int = 30, cwd: str | None = None) -> str:
     """
     Run ACL2 code and return the output.
 
     Args:
         code: ACL2 code to execute
         timeout: Timeout in seconds
+        cwd: Working directory for ACL2 process (optional)
 
     Returns:
         Output from ACL2
@@ -832,11 +857,27 @@ async def run_acl2(code: str, timeout: int = 30) -> str:
         temp_file = f.name
 
     try:
+        # Pass through environment variables, especially ACL2_SYSTEM_BOOKS
+        env = os.environ.copy()
+        
+        # TODO: Don't hardcode path - should come from env var configured in devcontainer
+        # Check if ACL2_SYSTEM_BOOKS is set, if not try to detect or fail gracefully
+        if 'ACL2_SYSTEM_BOOKS' not in env:
+            logger.warning("ACL2_SYSTEM_BOOKS not set in environment, using fallback")
+            env['ACL2_SYSTEM_BOOKS'] = '/home/acl2/books'
+        
+        # Log environment for debugging
+        acl2_vars = {k: v for k, v in env.items() if 'ACL2' in k}
+        logger.debug(f"ACL2 environment variables: {acl2_vars}")
+        logger.debug(f"Running ACL2 with cwd={cwd}")
+        
         process = await asyncio.create_subprocess_exec(
             "acl2",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+            env=env,
         )
 
         # Read the temp file and send to ACL2
@@ -908,12 +949,46 @@ async def certify_acl2_book(file_path: str, timeout: int = 120) -> str:
     except ValueError as e:
         return f"Error: {e}"
 
+    # Get the directory and check for .acl2 files
+    book_dir = str(Path(abs_path).parent)
+    book_name = Path(abs_path).stem
+    
+    # Check for .acl2 files (cert.acl2 or bookname.acl2)
+    book_acl2 = Path(book_dir) / f"{book_name}.acl2"
+    cert_acl2 = Path(book_dir) / "cert.acl2"
+    acl2_file = book_acl2 if book_acl2.exists() else (cert_acl2 if cert_acl2.exists() else None)
+    
     # Escape the book path for safe use in ACL2 code
     escaped_book_path = escape_acl2_string(book_path)
-
-    # Use certify-book command
-    code = f'(certify-book "{escaped_book_path}" ?)'
-    return await run_acl2(code, timeout)
+    
+    # Parse cert-flags from .acl2 file if present
+    cert_flags = "? t :ttags :all"  # Default: compile, allow all ttags
+    if acl2_file:
+        try:
+            with open(acl2_file, 'r') as f:
+                content = f.read()
+                # Look for cert-flags comment: ; cert-flags: <flags>
+                import re
+                match = re.search(r';\s*cert-flags:\s*(.+?)$', content, re.MULTILINE)
+                if match:
+                    cert_flags = match.group(1).strip()
+                    logger.info(f"CERTIFY_BOOK: Found cert-flags: {cert_flags}")
+        except Exception as e:
+            logger.warning(f"CERTIFY_BOOK: Could not read cert-flags from {acl2_file}: {e}")
+    
+    # Build code: if .acl2 file exists, load it first (from book directory) then certify
+    if acl2_file:
+        acl2_filename = acl2_file.name
+        escaped_acl2_filename = escape_acl2_string(acl2_filename)
+        logger.info(f"CERTIFY_BOOK: Loading .acl2 file: {acl2_filename} from directory: {book_dir}")
+        code = f'(ld "{escaped_acl2_filename}") (certify-book "{escaped_book_path}" {cert_flags})'
+    else:
+        logger.info(f"CERTIFY_BOOK: No .acl2 file found for {book_name}")
+        code = f'(certify-book "{escaped_book_path}" {cert_flags})'
+    
+    logger.info(f"CERTIFY_BOOK: code={code}, cwd={book_dir}")
+    # Run from book's directory so .acl2 file's relative paths work
+    return await run_acl2(code, timeout, cwd=book_dir)
 
 
 async def include_acl2_book(file_path: str, additional_code: str = "", timeout: int = 60) -> str:
@@ -971,6 +1046,7 @@ async def query_acl2_event(name: str, file_path: str = "", timeout: int = 30) ->
 
     # Build code to load file (if provided) and query the event
     code = ""
+    cwd = None
     if file_path:
         try:
             abs_path = validate_file_path(file_path)
@@ -979,11 +1055,12 @@ async def query_acl2_event(name: str, file_path: str = "", timeout: int = 30) ->
 
         escaped_path = escape_acl2_string(str(abs_path))
         code += f'(ld "{escaped_path}")\n'
+        cwd = str(Path(abs_path).parent)
 
     # Use :pe (print event) to show the definition
     code += f":pe {validated_name}"
 
-    return await run_acl2(code, timeout)
+    return await run_acl2(code, timeout, cwd=cwd)
 
 
 async def verify_function_guards(function_name: str, file_path: str = "", timeout: int = 60) -> str:
@@ -1006,6 +1083,7 @@ async def verify_function_guards(function_name: str, file_path: str = "", timeou
 
     # Build code to load file (if provided) and verify guards
     code = ""
+    cwd = None
     if file_path:
         try:
             abs_path = validate_file_path(file_path)
@@ -1014,11 +1092,12 @@ async def verify_function_guards(function_name: str, file_path: str = "", timeou
 
         escaped_path = escape_acl2_string(str(abs_path))
         code += f'(ld "{escaped_path}")\n'
+        cwd = str(Path(abs_path).parent)
 
     # Use verify-guards command
     code += f"(verify-guards {validated_name})"
 
-    return await run_acl2(code, timeout)
+    return await run_acl2(code, timeout, cwd=cwd)
 
 
 @app.call_tool()  # type: ignore[misc]
@@ -1370,10 +1449,13 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 
         # Escape the path and build code
         escaped_path = escape_acl2_string(str(abs_path))
+        
+        # Get the directory containing the file (for .acl2 file lookup)
+        file_dir = str(Path(abs_path).parent)
 
         # First load the file, then try to prove the theorem by name
         code = f'(ld "{escaped_path}")\n(thm (implies t ({validated_theorem})))'
-        output = await run_acl2(code, timeout)
+        output = await run_acl2(code, timeout, cwd=file_dir)
 
         return [
             TextContent(
