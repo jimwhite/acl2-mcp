@@ -73,6 +73,81 @@ Or via Python:
 python -m acl2_mcp.server
 ```
 
+### Running as HTTP Service
+
+To expose the MCP server over HTTP (for use with HTTP clients like the ACL2 `mcp-client` book), use `mcp-proxy`
+
+```bash
+# Install mcp-proxy
+pip install mcp-proxy
+
+# Run as HTTP server
+mcp-proxy acl2-mcp  --transport streamablehttp --port 8000 --allow-origin='*' --pass-environment 
+```
+
+**Example HTTP request:**
+```bash
+curl -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" -H "Accept: application/json" \
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"evaluate","arguments":{"code":"(+ 1 2)"}},"id":1}'
+```
+
+
+curl -X POST http://localhost:8000/mcp/messages/ \
+  -H "Content-Type: application/json" -H "Accept: application/json" \
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"start_session","arguments":{"name":"w00t"}},"id":1}'
+
+curl -X POST http://localhost:8000/mcp/messages/ \
+  -H "Content-Type: application/json" -H "Accept: application/json" \
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"list_sessions","arguments":{}},"id":1}'
+
+
+curl --request POST \
+  --url http://localhost:8000/mcp \
+  --header 'Accept: application/json' \
+  --header 'Content-Type: application/json' \
+  --data '{ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "start_session", "arguments": { "session_id" : "1" } } }'
+
+
+
+curl -i -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2024-11-05",
+          "capabilities": {},
+          "clientInfo": {
+            "name": "curl-client",
+            "version": "1.0.0"
+          }
+        }
+      }'
+
+curl -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Mcp-Session-Id: 4544f7ce413d4f858664dfc42e7f2255" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/list"
+  }'
+
+
+curl -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Mcp-Session-Id: 4544f7ce413d4f858664dfc42e7f2255" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method":"tools/call","params":{"name":"list_sessions","arguments":{}}
+  }'
+
 ### Configuring in Claude Desktop
 
 Add this to your Claude Desktop configuration file:

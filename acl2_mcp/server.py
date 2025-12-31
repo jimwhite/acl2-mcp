@@ -219,6 +219,7 @@ class ACL2Session:
     checkpoints: dict[str, SessionCheckpoint] = field(default_factory=dict)
     event_counter: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    banner_consumed: bool = False
 
     async def send_command(self, command: str, timeout: int = 30) -> str:
         """
@@ -245,6 +246,36 @@ class ACL2Session:
             timeout = validate_timeout(timeout)
 
             try:
+                # On first command, consume the startup banner
+                if not self.banner_consumed:
+                    banner_marker = f"___BANNER_{uuid.uuid4().hex}___"
+                    logger.info(f"Session {self.session_id}: Consuming banner with marker {banner_marker[:20]}...")
+                    try:
+                        # Send a no-op to flush the banner
+                        self.process.stdin.write(f'(cw "~%{banner_marker}~%")\n'.encode())
+                        await self.process.stdin.drain()
+                        
+                        # Read and discard until we see our banner marker
+                        banner_start = time.time()
+                        lines_read = 0
+                        while time.time() - banner_start < 15:  # 15s timeout for startup
+                            try:
+                                line = await asyncio.wait_for(
+                                    self.process.stdout.readline(),
+                                    timeout=1.0
+                                )
+                                if not line:
+                                    return "Error: Session process terminated during startup"
+                                lines_read += 1
+                                if banner_marker in line.decode():
+                                    logger.info(f"Session {self.session_id}: Banner consumed after {lines_read} lines")
+                                    break
+                            except asyncio.TimeoutError:
+                                continue
+                        self.banner_consumed = True
+                    except (BrokenPipeError, ConnectionResetError):
+                        return "Error: Session connection lost during startup"
+
                 # Send command
                 try:
                     self.process.stdin.write(f"{command}\n".encode())
@@ -385,6 +416,7 @@ class SessionManager:
             )
 
             self.sessions[session_id] = session
+            logger.info(f"Session {session_id} created (banner will be consumed on first command)")
 
             # Start cleanup task if not already running
             if self._cleanup_task is None:
@@ -392,8 +424,9 @@ class SessionManager:
 
             return session_id, f"Session started successfully. ID: {session_id}"
 
-        except Exception:
+        except Exception as e:
             # SECURITY: Don't leak internal error details
+            logger.error(f"Failed to start session: {e}")
             return "", "Error: Failed to start session"
 
     async def end_session(self, session_id: str) -> str:
@@ -1387,8 +1420,25 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         # try to load it with a very short timeout
         output = await run_acl2(code, timeout=5)
 
-        # Check for common error patterns
-        if "Error:" in output or "HARD ACL2 ERROR" in output:
+        # Check for actual SYNTAX error patterns (not runtime/semantic errors)
+        # - "end of file" means unbalanced parens
+        # - "unmatched close parenthesis" is obvious
+        # - "Read error" indicates parsing failed
+        # - "READER-ERROR" is a Common Lisp read error
+        syntax_error_patterns = [
+            "end of file on",
+            "unmatched close parenthesis",
+            "read error",
+            "reader-error",
+            "illegal terminating character",
+            "does not exist",  # Package X does not exist
+            "no dispatch function defined for",
+        ]
+        
+        output_lower = output.lower()
+        is_syntax_error = any(pattern in output_lower for pattern in syntax_error_patterns)
+        
+        if is_syntax_error:
             return [
                 TextContent(
                     type="text",
@@ -1399,7 +1449,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             return [
                 TextContent(
                     type="text",
-                    text="No obvious syntax errors detected.\n\n" + output,
+                    text="No syntax errors detected.\n\n" + output,
                 )
             ]
 
