@@ -276,28 +276,23 @@ class ACL2Session:
                     except (BrokenPipeError, ConnectionResetError):
                         return "Error: Session connection lost during startup"
 
-                # Send command
+                # SECURITY: Use cryptographically random marker to prevent injection
+                marker = f"___MARKER_{uuid.uuid4().hex}_{uuid.uuid4().hex}___"
+                
+                # Send command and marker together
+                # The marker is sent immediately after the command so we can detect completion
                 try:
                     self.process.stdin.write(f"{command}\n".encode())
+                    self.process.stdin.write(f'(cw "~%{marker}~%")\n'.encode())
                     await self.process.stdin.drain()
                 except (BrokenPipeError, ConnectionResetError):
                     return "Error: Session connection lost (broken pipe)"
 
                 # Read response with timeout
                 output_lines = []
-                # SECURITY: Use cryptographically random marker to prevent injection
-                marker = f"___MARKER_{uuid.uuid4().hex}_{uuid.uuid4().hex}___"
-
-                # Send a marker to know when we're done
-                try:
-                    self.process.stdin.write(f'(cw "~%{marker}~%")\n'.encode())
-                    await self.process.stdin.drain()
-                except (BrokenPipeError, ConnectionResetError):
-                    return "Error: Session connection lost (broken pipe)"
-
-                # SECURITY: Implement true total timeout, not per-line timeout
                 start_time = time.time()
                 marker_found = False
+                abort_detected = False
 
                 try:
                     while time.time() - start_time < timeout:
@@ -318,11 +313,46 @@ class ACL2Session:
                             if marker in decoded_line:
                                 marker_found = True
                                 break
+                            
+                            # Detect ACL2 abort - marker won't come after this
+                            if "ABORTING from raw Lisp" in decoded_line:
+                                abort_detected = True
+                                logger.info(f"Session {self.session_id}: Abort detected, will collect remaining output")
+                                
                         except asyncio.TimeoutError:
-                            # Continue reading until total timeout
+                            # If abort was detected and we hit timeout, ACL2 is waiting at prompt
+                            # Send a marker to flush remaining output
+                            if abort_detected:
+                                logger.info(f"Session {self.session_id}: Sending recovery marker after abort")
+                                recovery_marker = f"___RECOVERY_{uuid.uuid4().hex}___"
+                                try:
+                                    self.process.stdin.write(f'(cw "~%{recovery_marker}~%")\n'.encode())
+                                    await self.process.stdin.drain()
+                                    
+                                    # Read until we find the recovery marker
+                                    recovery_start = time.time()
+                                    while time.time() - recovery_start < 3:
+                                        try:
+                                            extra = await asyncio.wait_for(
+                                                self.process.stdout.readline(),
+                                                timeout=0.5
+                                            )
+                                            if not extra:
+                                                break
+                                            decoded = extra.decode()
+                                            if recovery_marker not in decoded:
+                                                output_lines.append(decoded)
+                                            if recovery_marker in decoded:
+                                                marker_found = True
+                                                break
+                                        except asyncio.TimeoutError:
+                                            continue
+                                except (BrokenPipeError, ConnectionResetError):
+                                    pass
+                                break
                             continue
 
-                    if not marker_found and (time.time() - start_time) >= timeout:
+                    if not marker_found:
                         return f"Error: Command execution timed out after {timeout} seconds"
 
                 except Exception:
