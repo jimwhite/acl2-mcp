@@ -427,10 +427,11 @@ class SessionManager:
                 logger.warning("ACL2_SYSTEM_BOOKS not set in environment for session, using fallback")
                 env['ACL2_SYSTEM_BOOKS'] = '/home/acl2/books'
             
-            logger.debug(f"Starting ACL2 session with ACL2_SYSTEM_BOOKS={env.get('ACL2_SYSTEM_BOOKS')}")
+            acl2_executable = env.get('ACL2', 'acl2')
+            logger.debug(f"Starting ACL2 session with ACL2={acl2_executable}, ACL2_SYSTEM_BOOKS={env.get('ACL2_SYSTEM_BOOKS')}")
             
             process = await asyncio.create_subprocess_exec(
-                "acl2",
+                acl2_executable,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
