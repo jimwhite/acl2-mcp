@@ -1,10 +1,10 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI coding agents (ZCode and other AGENTS.md-aware tools) when working with code in this repository.
 
 ## Project Overview
 
-This is an MCP (Model Context Protocol) server that provides tools for interacting with the ACL2 theorem prover. The server enables AI assistants to work with ACL2 through 15 different tools, supporting both one-off execution and persistent sessions for incremental development.
+This is an MCP (Model Context Protocol) server that provides tools for interacting with the ACL2 theorem prover. The server enables AI assistants to work with ACL2 through 19 different tools, supporting both one-off execution and persistent sessions for incremental development.
 
 ## Architecture
 

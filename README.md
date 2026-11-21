@@ -150,6 +150,30 @@ curl -X POST http://localhost:8000/mcp \
     "method":"tools/call","params":{"name":"list_sessions","arguments":{}}
   }'
 
+### Configuring in ZCode
+
+ZCode reads MCP servers from the workspace config (`<repo>/.zcode/config.json`) or from its user config (`~/.zcode/cli/config.json`); workspace-scoped servers connect automatically. Add the server to the workspace config:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "acl2": {
+        "type": "stdio",
+        "command": "/path/to/acl2-mcp/venv/bin/acl2-mcp",
+        "args": [],
+        "env": {
+          "ACL2_SYSTEM_BOOKS": "/path/to/acl2/books",
+          "ACL2": "/path/to/acl2/saved_acl2"
+        }
+      }
+    }
+  }
+}
+```
+
+You can also add it through **Settings → MCP** (user scope). Workspace scope is the better choice when the ACL2 binary lives inside a project container.
+
 ### Configuring in Claude Desktop
 
 Add this to your Claude Desktop configuration file:

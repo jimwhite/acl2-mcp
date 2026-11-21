@@ -7,7 +7,7 @@ This document describes the security measures implemented in the ACL2 MCP server
 
 ## Security Model
 
-The ACL2 MCP server executes arbitrary ACL2 code provided by the client. This is inherently powerful and requires careful security considerations. The server is designed to be run locally by a trusted user (e.g., as part of Claude Code) and assumes the client has permission to execute ACL2 code on the system.
+The ACL2 MCP server executes arbitrary ACL2 code provided by the client. This is inherently powerful and requires careful security considerations. The server is designed to be run locally by a trusted user (e.g., as part of ZCode or another trusted MCP client) and assumes the client has permission to execute ACL2 code on the system.
 
 ## Threat Model
 
@@ -164,7 +164,7 @@ See `tests/test_security.py` for complete test coverage.
 ## Best Practices for Deployment
 
 1. **Run Locally Only**: Never expose this server over a network
-2. **Trusted Clients**: Only allow trusted clients (e.g., Claude Code)
+2. **Trusted Clients**: Only allow trusted clients (e.g., ZCode)
 3. **Single User**: Do not use in multi-user or multi-tenant environments
 4. **Trusted Code**: Only execute ACL2 code you trust (ACL2 has full system access)
 5. **File Permissions**: Run with minimal necessary file access privileges
