@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Any, Sequence, Optional
 from dataclasses import dataclass, field
@@ -27,6 +28,11 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+try:
+    __version__ = package_version("acl2-mcp")
+except PackageNotFoundError:  # running from a source tree without an install
+    __version__ = "0.1.0"
 
 
 # Security constants
@@ -1608,8 +1614,20 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 
 
 async def handle_call_tool(_ctx: Any, params: Any) -> CallToolResult:
-    """MCP 2.x tools/call handler: unwrap the params and wrap the result."""
-    return CallToolResult(content=await call_tool(params.name, params.arguments or {}))
+    """MCP 2.x tools/call handler: unwrap the params and wrap the result.
+
+    Unknown-tool and validation failures are reported as tool results with
+    ``isError`` set, not as JSON-RPC errors, so the model sees a usable error
+    message instead of a protocol failure.
+    """
+    try:
+        content = await call_tool(params.name, params.arguments or {})
+    except ValueError as e:
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Error: {e}")],
+            is_error=True,
+        )
+    return CallToolResult(content=list(content))
 
 
 # Global server instance. Handlers are registered through the constructor, the
@@ -1617,7 +1635,7 @@ async def handle_call_tool(_ctx: Any, params: Any) -> CallToolResult:
 # after the 1.x series.
 app: Server = Server(
     "acl2-mcp",
-    version="0.1.0",
+    version=__version__,
     on_list_tools=handle_list_tools,
     on_call_tool=handle_call_tool,
 )
