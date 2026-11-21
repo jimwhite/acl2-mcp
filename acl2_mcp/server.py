@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, ListToolsResult, CallToolResult
 
 # Set up file logging for debugging
 logging.basicConfig(
@@ -559,10 +559,7 @@ class SessionManager:
 # Global session manager
 session_manager = SessionManager()
 
-app: Server = Server("acl2-mcp")
 
-
-@app.list_tools()  # type: ignore[misc,no-untyped-call]
 async def list_tools() -> list[Tool]:
     """List available ACL2 tools."""
     return [
@@ -933,10 +930,11 @@ async def run_acl2(code: str, timeout: int = 30, cwd: str | None = None) -> str:
         # Log environment for debugging
         acl2_vars = {k: v for k, v in env.items() if 'ACL2' in k}
         logger.debug(f"ACL2 environment variables: {acl2_vars}")
-        logger.debug(f"Running ACL2 with cwd={cwd}")
+        acl2_executable = env.get('ACL2', 'acl2')
+        logger.debug(f"Running ACL2 ({acl2_executable}) with cwd={cwd}")
         
         process = await asyncio.create_subprocess_exec(
-            "acl2",
+            acl2_executable,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -1164,7 +1162,11 @@ async def verify_function_guards(function_name: str, file_path: str = "", timeou
     return await run_acl2(code, timeout, cwd=cwd)
 
 
-@app.call_tool()  # type: ignore[misc]
+async def handle_list_tools(_ctx: Any, _params: Any) -> ListToolsResult:
+    """MCP 2.x tools/list handler: wrap the tool list in a result object."""
+    return ListToolsResult(tools=await list_tools())
+
+
 async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
     """Handle tool calls."""
     if name == "start_session":
@@ -1603,6 +1605,22 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 
     else:
         raise ValueError(f"Unknown tool: {name}")
+
+
+async def handle_call_tool(_ctx: Any, params: Any) -> CallToolResult:
+    """MCP 2.x tools/call handler: unwrap the params and wrap the result."""
+    return CallToolResult(content=await call_tool(params.name, params.arguments or {}))
+
+
+# Global server instance. Handlers are registered through the constructor, the
+# MCP 2.x API; the @app.list_tools()/@app.call_tool() decorators were removed
+# after the 1.x series.
+app: Server = Server(
+    "acl2-mcp",
+    version="0.1.0",
+    on_list_tools=handle_list_tools,
+    on_call_tool=handle_call_tool,
+)
 
 
 async def run() -> None:
