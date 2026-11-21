@@ -7,20 +7,21 @@ A Model Context Protocol (MCP) server that provides tools for interacting with t
 
 ## Features
 
-This MCP server exposes 15 tools for working with ACL2, including support for persistent sessions that enable incremental development:
+This MCP server exposes 19 tools for working with ACL2, including support for persistent sessions that enable incremental development:
 
 ### Session Management Tools
-- **start_session**: Create a persistent ACL2 session for incremental development
+- **start_session**: Create a persistent ACL2 session for incremental development. Accepts `parinfer` (default true) and `parinfer_mode` (default `indent`).
 - **end_session**: End a persistent session and clean up resources
 - **list_sessions**: List all active sessions with their status
 
 ### Code-based Tools
 - **prove**: Submit ACL2 theorems (defthm) for proof
 - **evaluate**: Evaluate arbitrary ACL2 expressions and definitions
-- **check_syntax**: Check ACL2 code for syntax errors
+- **check_syntax**: Check ACL2 code for syntax errors. Code is balanced with parinfer first (indent mode) unless `parinfer: false`; on success, `return_source: true` returns the balanced source, or `file_path` writes it and returns a confirmation.
 - **admit**: Test if an ACL2 event would be admitted without error
+- **parinfer**: Balance Lisp/ACL2 code in-process with parinfer (`indent`, `paren`, or `smart` mode; indent is the default)
 
-All code-based tools support an optional `session_id` parameter for incremental development.
+All code-based tools support an optional `session_id` parameter for incremental development. `prove`, `evaluate`, and `admit` balance code with parinfer by default; pass `parinfer: false` (per call) or disable it on the session to submit code unchanged.
 
 ### File-based Tools
 - **certify_book**: Certify an ACL2 book file (loads and verifies all definitions and theorems)
@@ -37,6 +38,7 @@ All code-based tools support an optional `session_id` parameter for incremental 
 - **restore_checkpoint**: Restore a session to a previously saved checkpoint
 - **get_world_state**: Display current session state (recent definitions and theorems)
 - **retry_proof**: Retry a failed proof with different hints
+- **export_session_code**: Export the source a session accepted (submissions with no ACL2 errors). Returns the source, or writes it to `file_path` and returns a confirmation with line and character counts.
 
 ## Prerequisites
 

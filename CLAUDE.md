@@ -91,6 +91,9 @@ Test organization:
 - **[tests/test_server.py](tests/test_server.py)**: Core functionality tests (tools, ACL2 execution)
 - **[tests/test_security.py](tests/test_security.py)**: Security validation tests
 - **[tests/test_sessions.py](tests/test_sessions.py)**: Session management tests
+- **[tests/test_parinfer.py](tests/test_parinfer.py)**: In-process parinfer balancing and session integration
+- **[tests/test_export.py](tests/test_export.py)**: Accepted-source export (text and file modes)
+- **[tests/test_syntax.py](tests/test_syntax.py)**: Parinfer-aware check_syntax source/file output
 
 All tests use `pytest-asyncio` for async testing.
 

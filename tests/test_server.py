@@ -122,7 +122,7 @@ async def test_call_tool_check_syntax_valid() -> None:
 async def test_call_tool_check_syntax_invalid() -> None:
     """Test syntax checking with invalid code."""
     arguments: dict[str, Any] = {
-        "code": "(defun incomplete",
+        "code": "(defun x () #q)",
     }
 
     result = await call_tool("check_syntax", arguments)
@@ -130,7 +130,7 @@ async def test_call_tool_check_syntax_invalid() -> None:
     assert len(result) == 1
     assert result[0].type == "text"
     # Will either report syntax errors or just show ACL2 waiting for input
-    assert len(result[0].text) > 0
+    assert "Syntax errors found" in result[0].text or "ACL2" in result[0].text
 
 
 @pytest.mark.asyncio

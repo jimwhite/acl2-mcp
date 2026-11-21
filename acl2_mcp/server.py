@@ -1,12 +1,15 @@
 """ACL2 MCP Server implementation."""
 
 import asyncio
+import ctypes
+import json
 import logging
 import os
 import re
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from importlib.metadata import PackageNotFoundError, version as package_version
@@ -44,6 +47,10 @@ MAX_SESSIONS = 50  # Maximum concurrent sessions
 MAX_CHECKPOINT_NAME_LENGTH = 100  # Maximum checkpoint name length
 MAX_CHECKPOINTS_PER_SESSION = 50  # Maximum checkpoints per session
 MAX_SESSION_NAME_LENGTH = 100  # Maximum session name length
+MAX_EXPORT_LENGTH = 10_000_000  # Maximum accumulated source returned by an export
+DEFAULT_PARINFER_LIB = "/usr/local/lib/libparinfer_rust.so"
+PARINFER_MODES = ("indent", "paren", "smart")
+DEFAULT_PARINFER_MODE = "indent"  # indent mode: derive parens from indentation
 
 
 def validate_timeout(timeout: int) -> int:
@@ -127,6 +134,157 @@ def validate_file_path(file_path: str) -> Path:
         raise ValueError(f"Path is not a file: {abs_path.name}")
 
     return abs_path
+
+
+def validate_output_path(file_path: str, overwrite: bool = False) -> Path:
+    """
+    Validate a destination path for a file the server will write.
+
+    Args:
+        file_path: Path to validate
+        overwrite: Whether an existing file may be replaced
+
+    Returns:
+        Resolved absolute path
+
+    Raises:
+        ValueError: If the path is invalid or the file exists without overwrite
+    """
+    if not file_path or not file_path.strip():
+        raise ValueError("File path cannot be empty")
+
+    abs_path = Path(file_path).expanduser().resolve()
+
+    if abs_path.exists():
+        if abs_path.is_dir():
+            raise ValueError(f"Path is a directory: {abs_path.name}")
+        if not overwrite:
+            raise ValueError(
+                f"File already exists: {abs_path.name} (set overwrite=true to replace it)"
+            )
+
+    if not abs_path.parent.is_dir():
+        raise ValueError(f"Parent directory does not exist: {abs_path.parent}")
+
+    return abs_path
+
+
+# Parinfer is loaded in-process from the parinfer-rust cdylib; no CLI subprocess.
+_parinfer_lib: Optional[ctypes.CDLL] = None
+_parinfer_lib_error: Optional[str] = None
+_parinfer_lib_lock = threading.Lock()
+
+
+def _load_parinfer_lib() -> Optional[ctypes.CDLL]:
+    """Load and cache the parinfer shared library, or return None."""
+    global _parinfer_lib, _parinfer_lib_error
+
+    with _parinfer_lib_lock:
+        if _parinfer_lib is not None:
+            return _parinfer_lib
+        if _parinfer_lib_error is not None:
+            return None
+
+        lib_path = os.environ.get("PARINFER_LIB", DEFAULT_PARINFER_LIB)
+        try:
+            lib = ctypes.CDLL(lib_path)
+            lib.run_parinfer.restype = ctypes.c_char_p
+            lib.run_parinfer.argtypes = [ctypes.c_char_p]
+        except OSError as e:
+            _parinfer_lib_error = f"could not load parinfer library {lib_path}: {e}"
+            logger.warning(_parinfer_lib_error)
+            return None
+
+        _parinfer_lib = lib
+        logger.debug(f"Loaded parinfer library from {lib_path}")
+        return lib
+
+
+def parinfer_available() -> bool:
+    """Whether the in-process parinfer library can be loaded."""
+    return _load_parinfer_lib() is not None
+
+
+def _parinfer_sync(code: str, mode: str) -> tuple[bool, str, Optional[str]]:
+    """Run parinfer synchronously. Returns (success, text, error_message)."""
+    lib = _load_parinfer_lib()
+    if lib is None:
+        return False, code, _parinfer_lib_error or "parinfer library unavailable"
+
+    # JSON input bypasses parinfer's language-default table, so spell out the
+    # Common Lisp/ACL2 features here. lineCommentQuotes=false is the CL fix
+    # (upstream PR 157): ';' comments end at the newline, so a quote inside one
+    # is prose, not an unterminated string.
+    request = {
+        "mode": mode,
+        "text": code,
+        "options": {
+            "commentChar": ";",
+            "stringDelimiters": ['"'],
+            "lispVlineSymbols": True,
+            "lispBlockComments": True,
+            "lineCommentQuotes": False,
+        },
+    }
+
+    try:
+        raw = lib.run_parinfer(json.dumps(request).encode("utf-8"))
+        answer = json.loads(raw)
+    except Exception as e:
+        logger.warning(f"parinfer call failed: {e}")
+        return False, code, f"parinfer call failed: {e}"
+
+    if answer.get("success"):
+        return True, answer.get("text", code), None
+
+    error = answer.get("error") or {}
+    message = error.get("message") or "parinfer reported an error"
+    line_no = error.get("lineNo")
+    if isinstance(line_no, int):
+        message = f"{message} (line {line_no + 1})"
+    return False, code, message
+
+
+async def run_parinfer(
+    code: str, mode: str = DEFAULT_PARINFER_MODE
+) -> tuple[bool, str, Optional[str]]:
+    """Run parinfer off the event loop. Returns (success, text, error_message)."""
+    return await asyncio.to_thread(_parinfer_sync, code, mode)
+
+
+async def balance_if_enabled(
+    code: str, enabled: bool, mode: str = DEFAULT_PARINFER_MODE
+) -> tuple[str, Optional[str]]:
+    """Balance code when enabled.
+
+    Returns (code_to_send, error). If parinfer is disabled, unavailable, or the
+    code is over the size limit, the original code is returned unchanged.
+    """
+    if not enabled or len(code) > MAX_CODE_LENGTH:
+        return code, None
+    if not parinfer_available():
+        logger.warning("parinfer library unavailable; submitting code unchanged")
+        return code, None
+    success, balanced, error = await run_parinfer(code, mode)
+    if not success:
+        return code, error
+    return balanced, None
+
+
+_ACL2_FAILURE_MARKERS = (
+    "ACL2 Error",
+    "ACL2 Halted",
+    "HARD ACL2 ERROR",
+    "ABORTING from raw Lisp",
+    "******** FAILED ********",
+)
+
+
+def acl2_output_failed(output: str) -> bool:
+    """Whether ACL2 output indicates the submission was not accepted."""
+    if output.startswith("Error: "):
+        return True
+    return any(marker in output for marker in _ACL2_FAILURE_MARKERS)
 
 
 def validate_checkpoint_name(name: str) -> str:
@@ -226,6 +384,10 @@ class ACL2Session:
     event_counter: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     banner_consumed: bool = False
+    parinfer_enabled: bool = True
+    parinfer_mode: str = DEFAULT_PARINFER_MODE
+    accepted_code: list[str] = field(default_factory=list)
+    accepted_code_size: int = 0
 
     async def send_command(self, command: str, timeout: int = 30) -> str:
         """
@@ -374,6 +536,17 @@ class ACL2Session:
                 # SECURITY: Don't leak internal details in error messages
                 return "Error: Failed to execute command in session"
 
+    def record_accepted(self, code: str) -> None:
+        """Record source that ACL2 accepted, up to the export size cap."""
+        if self.accepted_code_size + len(code) > MAX_EXPORT_LENGTH:
+            logger.warning(
+                f"Session {self.session_id}: accepted source cap "
+                f"({MAX_EXPORT_LENGTH} characters) reached; not recording more"
+            )
+            return
+        self.accepted_code.append(code)
+        self.accepted_code_size += len(code)
+
     async def terminate(self) -> None:
         """Terminate the ACL2 session."""
         try:
@@ -394,6 +567,19 @@ class ACL2Session:
             await self.process.wait()
 
 
+def resolve_parinfer(arguments: Any, session: Optional[ACL2Session]) -> tuple[bool, str]:
+    """Resolve the per-call parinfer override against the session setting."""
+    override = arguments.get("parinfer")
+    if isinstance(override, bool):
+        enabled = override
+    elif session is not None:
+        enabled = session.parinfer_enabled
+    else:
+        enabled = True
+    mode = session.parinfer_mode if session is not None else DEFAULT_PARINFER_MODE
+    return enabled, mode
+
+
 class SessionManager:
     """Manages persistent ACL2 sessions."""
 
@@ -401,12 +587,19 @@ class SessionManager:
         self.sessions: dict[str, ACL2Session] = {}
         self._cleanup_task: Optional[asyncio.Task[None]] = None
 
-    async def start_session(self, name: Optional[str] = None) -> tuple[str, str]:
+    async def start_session(
+        self,
+        name: Optional[str] = None,
+        parinfer_enabled: bool = True,
+        parinfer_mode: str = DEFAULT_PARINFER_MODE,
+    ) -> tuple[str, str]:
         """
         Start a new persistent ACL2 session.
 
         Args:
             name: Optional human-readable name for the session
+            parinfer_enabled: Whether to balance submitted code with parinfer
+            parinfer_mode: Parinfer mode (indent, paren, or smart)
 
         Returns:
             Tuple of (session_id, message)
@@ -420,6 +613,9 @@ class SessionManager:
                 name = validate_session_name(name)
             except ValueError as e:
                 return "", f"Error: Invalid session name - {e}"
+
+        if parinfer_mode not in PARINFER_MODES:
+            return "", f"Error: parinfer_mode must be one of {', '.join(PARINFER_MODES)}"
 
         session_id = str(uuid.uuid4())
 
@@ -450,6 +646,8 @@ class SessionManager:
                 process=process,
                 created_at=time.time(),
                 last_activity=time.time(),
+                parinfer_enabled=parinfer_enabled,
+                parinfer_mode=parinfer_mode,
             )
 
             self.sessions[session_id] = session
@@ -502,7 +700,8 @@ class SessionManager:
             name_str = f" ({session.name})" if session.name else ""
             lines.append(
                 f"  {session_id}{name_str}: "
-                f"age={age:.0f}s, idle={idle:.0f}s, events={session.event_counter}"
+                f"age={age:.0f}s, idle={idle:.0f}s, events={session.event_counter}, "
+                f"parinfer={'on' if session.parinfer_enabled else 'off'}"
             )
 
         return "\n".join(lines)
@@ -579,6 +778,17 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional human-readable name for the session. Example: 'natural-numbers-proof'",
                     },
+                    "parinfer": {
+                        "type": "boolean",
+                        "description": "Balance submitted code with parinfer before sending (default: true)",
+                        "default": True,
+                    },
+                    "parinfer_mode": {
+                        "type": "string",
+                        "enum": list(PARINFER_MODES),
+                        "description": "Parinfer mode for this session (default: indent)",
+                        "default": DEFAULT_PARINFER_MODE,
+                    },
                 },
             },
         ),
@@ -623,6 +833,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional: ID of persistent session to use. If not provided, creates a fresh ACL2 session for this command only.",
                     },
+                    "parinfer": {
+                        "type": "boolean",
+                        "description": "Override the session's parinfer setting for this call (default: session setting; true without a session)",
+                    },
                 },
                 "required": ["code"],
             },
@@ -646,19 +860,42 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional: ID of persistent session to use. If not provided, creates a fresh ACL2 session for this command only.",
                     },
+                    "parinfer": {
+                        "type": "boolean",
+                        "description": "Override the session's parinfer setting for this call (default: session setting; true without a session)",
+                    },
                 },
                 "required": ["code"],
             },
         ),
         Tool(
             name="check_syntax",
-            description="Quickly check ACL2 code for syntax errors without full execution. Use this before 'admit' or 'prove' to catch basic errors. Faster than full evaluation but less thorough.",
+            description="Quickly check ACL2 code for syntax errors without full execution. By default the code is first balanced with parinfer (indent mode). On success, either return the balanced source or write it to a file. Use this before 'admit' or 'prove' to catch basic errors. Faster than full evaluation but less thorough.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
                         "description": "ACL2 code to check",
+                    },
+                    "parinfer": {
+                        "type": "boolean",
+                        "description": "Balance the code with parinfer before checking (default: true)",
+                        "default": True,
+                    },
+                    "return_source": {
+                        "type": "boolean",
+                        "description": "On success, return the balanced source instead of the usual diagnostics (default: false)",
+                        "default": False,
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "On success, write the balanced source to this path and return a confirmation instead of the source",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Allow replacing an existing file when file_path is given (default: false)",
+                        "default": False,
                     },
                 },
                 "required": ["code"],
@@ -747,6 +984,10 @@ async def list_tools() -> list[Tool]:
                     "session_id": {
                         "type": "string",
                         "description": "Optional: ID of persistent session to use. If not provided, creates a fresh ACL2 session for this command only.",
+                    },
+                    "parinfer": {
+                        "type": "boolean",
+                        "description": "Override the session's parinfer setting for this call (default: session setting; true without a session)",
                     },
                 },
                 "required": ["code"],
@@ -893,6 +1134,54 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["session_id", "code"],
+            },
+        ),
+        Tool(
+            name="parinfer",
+            description="Balance Lisp/ACL2 parentheses and indentation with parinfer. Indent mode is the default: parentheses are derived from indentation, which suits code written in bulk (LLMs are usually good at indentation but miss parens). Use 'paren' mode to validate existing parens and fix indentation instead.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Lisp/ACL2 source to balance",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": list(PARINFER_MODES),
+                        "description": "Parinfer mode (default: indent)",
+                        "default": DEFAULT_PARINFER_MODE,
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": "Language dialect. Only 'lisp' is supported, which matches ACL2 (vline symbols and block comments enabled; quotes in ';' comments ignored).",
+                        "default": "lisp",
+                    },
+                },
+                "required": ["code"],
+            },
+        ),
+        Tool(
+            name="export_session_code",
+            description="Export the source code that a persistent session accepted (submissions that produced no ACL2 errors). Without file_path, returns the source text. With file_path, writes the source to that file and returns only a confirmation with the path, line count, and character count.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "ID of the session to export",
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Optional: write the accepted source to this path instead of returning it",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Allow replacing an existing file when file_path is given (default: false)",
+                        "default": False,
+                    },
+                },
+                "required": ["session_id"],
             },
         ),
     ]
@@ -1177,7 +1466,13 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
     """Handle tool calls."""
     if name == "start_session":
         session_name = arguments.get("name")
-        session_id, message = await session_manager.start_session(session_name)
+        parinfer_enabled = arguments.get("parinfer", True)
+        parinfer_mode = arguments.get("parinfer_mode", DEFAULT_PARINFER_MODE)
+        session_id, message = await session_manager.start_session(
+            session_name,
+            parinfer_enabled=bool(parinfer_enabled),
+            parinfer_mode=parinfer_mode,
+        )
         return [
             TextContent(
                 type="text",
@@ -1406,6 +1701,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         timeout = arguments.get("timeout", 30)
         session_id = arguments.get("session_id")
 
+        session = None
         if session_id:
             session = session_manager.get_session(session_id)
             if not session:
@@ -1415,14 +1711,30 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                         text=f"Error: Session {session_id} not found",
                     )
                 ]
-            output = await session.send_command(code, timeout)
-        else:
-            output = await run_acl2(code, timeout)
 
+        use_parinfer, parinfer_mode = resolve_parinfer(arguments, session)
+        balanced, parinfer_error = await balance_if_enabled(code, use_parinfer, parinfer_mode)
+        if parinfer_error:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: parinfer could not balance the code: {parinfer_error}\n"
+                    "(Use parinfer=false to submit it unchanged.)",
+                )
+            ]
+
+        if session is not None:
+            output = await session.send_command(balanced, timeout)
+            if not acl2_output_failed(output):
+                session.record_accepted(balanced)
+        else:
+            output = await run_acl2(balanced, timeout)
+
+        note = "[parinfer adjusted the code]\n\n" if balanced != code else ""
         return [
             TextContent(
                 type="text",
-                text=output,
+                text=note + output,
             )
         ]
 
@@ -1431,6 +1743,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         timeout = arguments.get("timeout", 30)
         session_id = arguments.get("session_id")
 
+        session = None
         if session_id:
             session = session_manager.get_session(session_id)
             if not session:
@@ -1440,24 +1753,67 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                         text=f"Error: Session {session_id} not found",
                     )
                 ]
-            output = await session.send_command(code, timeout)
-        else:
-            output = await run_acl2(code, timeout)
 
+        use_parinfer, parinfer_mode = resolve_parinfer(arguments, session)
+        balanced, parinfer_error = await balance_if_enabled(code, use_parinfer, parinfer_mode)
+        if parinfer_error:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: parinfer could not balance the code: {parinfer_error}\n"
+                    "(Use parinfer=false to submit it unchanged.)",
+                )
+            ]
+
+        if session is not None:
+            output = await session.send_command(balanced, timeout)
+            if not acl2_output_failed(output):
+                session.record_accepted(balanced)
+        else:
+            output = await run_acl2(balanced, timeout)
+
+        note = "[parinfer adjusted the code]\n\n" if balanced != code else ""
         return [
             TextContent(
                 type="text",
-                text=output,
+                text=note + output,
             )
         ]
 
     elif name == "check_syntax":
         code = arguments["code"]
+        use_parinfer = arguments.get("parinfer", True)
+        return_source = bool(arguments.get("return_source", False))
+        file_path = arguments.get("file_path")
+        overwrite = bool(arguments.get("overwrite", False))
+
+        if file_path and return_source:
+            return [
+                TextContent(
+                    type="text",
+                    text="Error: file_path and return_source are mutually exclusive; choose one.",
+                )
+            ]
+
+        # Balance first (indent mode): LLM-written code tends to have good
+        # indentation but missing/extra parens. The syntax check then runs on
+        # the balanced source, which is what gets returned or written.
+        balanced, parinfer_error = await balance_if_enabled(
+            code, bool(use_parinfer), DEFAULT_PARINFER_MODE
+        )
+        if parinfer_error:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: parinfer could not balance the code: {parinfer_error}\n"
+                    "(Use parinfer=false to check it unchanged.)",
+                )
+            ]
 
         # For syntax checking, we can try to parse without executing
         # ACL2 doesn't have a dedicated syntax checker, so we'll just
         # try to load it with a very short timeout
-        output = await run_acl2(code, timeout=5)
+        output = await run_acl2(balanced, timeout=5)
 
         # Check for actual SYNTAX error patterns (not runtime/semantic errors)
         # - "end of file" means unbalanced parens
@@ -1473,10 +1829,10 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             "does not exist",  # Package X does not exist
             "no dispatch function defined for",
         ]
-        
+
         output_lower = output.lower()
         is_syntax_error = any(pattern in output_lower for pattern in syntax_error_patterns)
-        
+
         if is_syntax_error:
             return [
                 TextContent(
@@ -1484,13 +1840,51 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                     text=f"Syntax errors found:\n\n{output}",
                 )
             ]
-        else:
+
+        if file_path:
+            try:
+                out_path = validate_output_path(file_path, overwrite=overwrite)
+            except ValueError as e:
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Error: {e}",
+                    )
+                ]
+
+            source = balanced if balanced.endswith("\n") else balanced + "\n"
+            try:
+                out_path.write_text(source, encoding="utf-8")
+            except OSError as e:
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Error: could not write {out_path.name}: {e}",
+                    )
+                ]
+
             return [
                 TextContent(
                     type="text",
-                    text="No syntax errors detected.\n\n" + output,
+                    text=f"Wrote {len(source.splitlines())} lines "
+                    f"({len(source)} characters) to {out_path}.",
                 )
             ]
+
+        if return_source:
+            return [
+                TextContent(
+                    type="text",
+                    text=balanced,
+                )
+            ]
+
+        return [
+            TextContent(
+                type="text",
+                text="No syntax errors detected.\n\n" + output,
+            )
+        ]
 
     elif name == "certify_book":
         file_path = arguments["file_path"]
@@ -1558,6 +1952,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         timeout = arguments.get("timeout", 30)
         session_id = arguments.get("session_id")
 
+        session = None
         if session_id:
             session = session_manager.get_session(session_id)
             if not session:
@@ -1567,17 +1962,32 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                         text=f"Error: Session {session_id} not found",
                     )
                 ]
-            output = await session.send_command(code, timeout)
+
+        use_parinfer, parinfer_mode = resolve_parinfer(arguments, session)
+        balanced, parinfer_error = await balance_if_enabled(code, use_parinfer, parinfer_mode)
+        if parinfer_error:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: parinfer could not balance the code: {parinfer_error}\n"
+                    "(Use parinfer=false to submit it unchanged.)",
+                )
+            ]
+
+        if session is not None:
+            output = await session.send_command(balanced, timeout)
         else:
-            output = await run_acl2(code, timeout)
+            output = await run_acl2(balanced, timeout)
 
-        # Check if the event was admitted successfully
-        success = "Error" not in output and "FAILED" not in output
+        success = not acl2_output_failed(output)
+        if success and session is not None:
+            session.record_accepted(balanced)
 
+        note = "[parinfer adjusted the code]\n\n" if balanced != code else ""
         return [
             TextContent(
                 type="text",
-                text=f"Admit {'succeeded' if success else 'failed'}:\n\n{output}",
+                text=f"{note}Admit {'succeeded' if success else 'failed'}:\n\n{output}",
             )
         ]
 
@@ -1606,6 +2016,120 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             TextContent(
                 type="text",
                 text=output,
+            )
+        ]
+
+    elif name == "parinfer":
+        code = arguments["code"]
+        mode = arguments.get("mode", DEFAULT_PARINFER_MODE)
+        language = arguments.get("language", "lisp")
+
+        if mode not in PARINFER_MODES:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: mode must be one of {', '.join(PARINFER_MODES)}",
+                )
+            ]
+
+        if language != "lisp":
+            return [
+                TextContent(
+                    type="text",
+                    text="Error: only language 'lisp' is supported (ACL2 is Common Lisp)",
+                )
+            ]
+
+        if len(code) > MAX_CODE_LENGTH:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: Code exceeds maximum length of {MAX_CODE_LENGTH} characters",
+                )
+            ]
+
+        if not parinfer_available():
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: {_parinfer_lib_error or 'parinfer library unavailable'}\n"
+                    "Set PARINFER_LIB to the parinfer-rust shared library path.",
+                )
+            ]
+
+        success, balanced, error = await run_parinfer(code, mode)
+        if not success:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: parinfer failed: {error}",
+                )
+            ]
+
+        return [
+            TextContent(
+                type="text",
+                text=balanced,
+            )
+        ]
+
+    elif name == "export_session_code":
+        session_id = arguments["session_id"]
+        file_path = arguments.get("file_path")
+        overwrite = bool(arguments.get("overwrite", False))
+
+        session = session_manager.get_session(session_id)
+        if not session:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: Session {session_id} not found",
+                )
+            ]
+
+        if not session.accepted_code:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"No accepted code in session {session_id}.",
+                )
+            ]
+
+        source = "\n\n".join(form.rstrip() for form in session.accepted_code) + "\n"
+
+        if file_path:
+            try:
+                out_path = validate_output_path(file_path, overwrite=overwrite)
+            except ValueError as e:
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Error: {e}",
+                    )
+                ]
+
+            try:
+                out_path.write_text(source, encoding="utf-8")
+            except OSError as e:
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Error: could not write {out_path.name}: {e}",
+                    )
+                ]
+
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Exported {len(session.accepted_code)} accepted form(s) to {out_path} "
+                    f"({len(source.splitlines())} lines, {len(source)} characters).",
+                )
+            ]
+
+        return [
+            TextContent(
+                type="text",
+                text=source,
             )
         ]
 

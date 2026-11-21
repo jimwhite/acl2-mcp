@@ -30,9 +30,11 @@ async def test_connects_in_modern_era_and_lists_tools() -> None:
         result = await client.list_tools()
         names = {tool.name for tool in result.tools}
 
-        assert len(names) == 17
+        assert len(names) == 19
         assert "evaluate" in names
         assert "prove" in names
+        assert "parinfer" in names
+        assert "export_session_code" in names
 
 
 @pytest.mark.asyncio

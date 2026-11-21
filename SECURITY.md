@@ -78,6 +78,14 @@ The ACL2 MCP server executes arbitrary ACL2 code provided by the client. This is
 - Allows reading any file the process can access
 - Suitable for local single-user usage only
 
+**Output Path Validation** (`validate_output_path`, used by `check_syntax` and
+`export_session_code` when `file_path` is given):
+- Resolves to absolute paths
+- Requires the parent directory to exist
+- Rejects directory targets
+- Refuses to overwrite an existing file unless `overwrite: true`
+- Writes are not confined to an allowed directory, same as reads
+
 ### 4. Process Isolation
 
 - ACL2 runs as separate subprocess
@@ -140,6 +148,13 @@ See `tests/test_security.py` for complete test coverage.
 - One user/client could consume all 50 session slots
 - No quotas on checkpoint creation beyond per-session limit
 - **Mitigation**: Suitable for single-user local deployment only
+
+**Write-Capable Tools**:
+- `check_syntax` with `file_path` and `export_session_code` with `file_path`
+  write files on the server's filesystem
+- Existing files are only replaced when `overwrite: true` is passed
+- No directory confinement: the server can write anywhere the process can
+- **Mitigation**: Only use with trusted clients and users
 
 **Stderr Not Monitored in Sessions**:
 - stderr buffer could fill and cause process blocking
