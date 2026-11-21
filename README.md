@@ -17,11 +17,11 @@ This MCP server exposes 19 tools for working with ACL2, including support for pe
 ### Code-based Tools
 - **prove**: Submit ACL2 theorems (defthm) for proof
 - **evaluate**: Evaluate arbitrary ACL2 expressions and definitions
-- **check_syntax**: Check ACL2 code for syntax errors. Code is balanced with parinfer first (indent mode) unless `parinfer: false`; on success, `return_source: true` returns the balanced source, or `file_path` writes it and returns a confirmation.
+- **check_syntax**: Check ACL2 code for syntax errors. Code is balanced with parinfer first (indent mode) unless `parinfer: false`; on success, `return_source: true` returns the balanced source, `output_path` (or its alias `file_path`) writes a different file, and `in_place: true` rewrites the input file. A failed check never writes.
 - **admit**: Test if an ACL2 event would be admitted without error
-- **parinfer**: Balance Lisp/ACL2 code in-process with parinfer (`indent`, `paren`, or `smart` mode; indent is the default)
+- **parinfer**: Balance Lisp/ACL2 code in-process with parinfer (`indent`, `paren`, or `smart` mode; indent is the default). Returns the balanced source, or writes it to `output_path`/`file_path` or back to the input with `in_place`.
 
-All code-based tools support an optional `session_id` parameter for incremental development. `prove`, `evaluate`, and `admit` balance code with parinfer by default; pass `parinfer: false` (per call) or disable it on the session to submit code unchanged.
+All code-based tools accept either inline `code` or an `input_path` file (exactly one). They also support an optional `session_id` parameter for incremental development. `prove`, `evaluate`, and `admit` balance code with parinfer by default; pass `parinfer: false` (per call) or disable it on the session to submit code unchanged.
 
 ### File-based Tools
 - **certify_book**: Certify an ACL2 book file (loads and verifies all definitions and theorems)

@@ -227,6 +227,112 @@ def validate_output_path(file_path: str, overwrite: bool = False) -> Path:
     return abs_path
 
 
+def read_source_argument(arguments: Any) -> tuple[str, Optional[Path]]:
+    """
+    Get source text from either ``code`` or ``input_path``.
+
+    Returns:
+        Tuple of (source, resolved input path or None).  Exactly one of the
+        two arguments must be supplied.
+
+    Raises:
+        ValueError: If the arguments are ambiguous, missing, or unreadable
+    """
+    code = arguments.get("code")
+    input_path = arguments.get("input_path")
+
+    if code is not None and input_path is not None:
+        raise ValueError("Provide either code or input_path, not both")
+    if code is None and input_path is None:
+        raise ValueError("Provide either code or input_path")
+
+    if input_path is not None:
+        abs_path = validate_file_path(str(input_path))
+        try:
+            code = abs_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            raise ValueError(f"File is not valid UTF-8: {abs_path.name}")
+        except OSError as e:
+            raise ValueError(f"Could not read {abs_path.name}: {e}")
+        if len(code) > MAX_CODE_LENGTH:
+            raise ValueError(
+                f"Source exceeds maximum length of {MAX_CODE_LENGTH} characters"
+            )
+        return code, abs_path
+
+    if not isinstance(code, str):
+        raise ValueError("code must be a string")
+    if len(code) > MAX_CODE_LENGTH:
+        raise ValueError(
+            f"Code exceeds maximum length of {MAX_CODE_LENGTH} characters"
+        )
+    return code, None
+
+
+def resolve_write_destination(
+    arguments: Any, input_abs: Optional[Path]
+) -> Optional[Path]:
+    """
+    Resolve where balanced source should be written, if anywhere.
+
+    Accepts ``in_place`` (rewrite the input file), ``output_path`` (a
+    different file), or ``file_path`` as a backward-compatible alias for
+    ``output_path``.  Returns None when the caller just wants the source.
+
+    Raises:
+        ValueError: If the options conflict or the destination is not writable
+    """
+    in_place = bool(arguments.get("in_place", False))
+    output_path = arguments.get("output_path")
+    legacy_path = arguments.get("file_path")
+
+    if (
+        output_path is not None
+        and legacy_path is not None
+        and str(output_path) != str(legacy_path)
+    ):
+        raise ValueError("Provide only one of output_path and file_path")
+    destination = output_path if output_path is not None else legacy_path
+
+    if in_place:
+        if input_abs is None:
+            raise ValueError("in_place requires input_path")
+        if destination is not None:
+            raise ValueError(
+                "in_place cannot be combined with output_path/file_path"
+            )
+        # Rewriting the input is explicit consent to replace it.
+        return input_abs
+
+    if destination is None:
+        return None
+
+    return validate_output_path(
+        str(destination), overwrite=bool(arguments.get("overwrite", False))
+    )
+
+
+def write_balanced_source(destination: Path, source: str) -> str:
+    """
+    Write balanced source to destination, ensuring a trailing newline.
+
+    Returns:
+        A short confirmation message for the caller.
+
+    Raises:
+        ValueError: If the file cannot be written
+    """
+    text = source if source.endswith("\n") else source + "\n"
+    try:
+        destination.write_text(text, encoding="utf-8")
+    except OSError as e:
+        raise ValueError(f"Could not write {destination.name}: {e}")
+    return (
+        f"Wrote {len(text.splitlines())} lines "
+        f"({len(text)} characters) to {destination}."
+    )
+
+
 # Parinfer is loaded in-process from the parinfer-rust cdylib; no CLI subprocess.
 _parinfer_lib: Optional[ctypes.CDLL] = None
 _parinfer_lib_error: Optional[str] = None
@@ -940,13 +1046,17 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="prove",
-            description="Submit an ACL2 theorem (defthm) for proof. Use this to prove mathematical properties. Example: (defthm append-nil (implies (true-listp x) (equal (append x nil) x))). The theorem will be proven and added to the ACL2 world. Returns detailed ACL2 proof output. Can optionally use a persistent session for incremental development.",
+            description="Submit an ACL2 theorem (defthm) for proof. Use this to prove mathematical properties. Example: (defthm append-nil (implies (true-listp x) (equal (append x nil) x))). Input is either inline code or an input_path file. The theorem will be proven and added to the ACL2 world. Returns detailed ACL2 proof output. Can optionally use a persistent session for incremental development.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "ACL2 code to prove (e.g., defthm form)",
+                        "description": "ACL2 code to prove (e.g., defthm form). Provide this or input_path (not both).",
+                    },
+                    "input_path": {
+                        "type": "string",
+                        "description": "Read the code to prove from this file instead of passing code in the call",
                     },
                     "timeout": {
                         "type": "number",
@@ -962,18 +1072,21 @@ async def list_tools() -> list[Tool]:
                         "description": "Override the session's parinfer setting for this call (default: session setting; true without a session)",
                     },
                 },
-                "required": ["code"],
             },
         ),
         Tool(
             name="evaluate",
-            description="Evaluate ACL2 expressions or define functions (defun). Use this for: 1) Defining functions, 2) Computing values, 3) Testing expressions. Example: (defun factorial (n) (if (zp n) 1 (* n (factorial (- n 1))))) or (+ 1 2). Returns the ACL2 evaluation result. Can optionally use a persistent session for incremental development.",
+            description="Evaluate ACL2 expressions or define functions (defun). Use this for: 1) Defining functions, 2) Computing values, 3) Testing expressions. Example: (defun factorial (n) (if (zp n) 1 (* n (factorial (- n 1))))) or (+ 1 2). Input is either inline code or an input_path file. Returns the ACL2 evaluation result. Can optionally use a persistent session for incremental development.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "ACL2 code to evaluate",
+                        "description": "ACL2 code to evaluate. Provide this or input_path (not both).",
+                    },
+                    "input_path": {
+                        "type": "string",
+                        "description": "Read the code to evaluate from this file instead of passing code in the call",
                     },
                     "timeout": {
                         "type": "number",
@@ -989,18 +1102,21 @@ async def list_tools() -> list[Tool]:
                         "description": "Override the session's parinfer setting for this call (default: session setting; true without a session)",
                     },
                 },
-                "required": ["code"],
             },
         ),
         Tool(
             name="check_syntax",
-            description="Quickly check ACL2 code for syntax errors without full execution. By default the code is first balanced with parinfer (indent mode). On success, either return the balanced source or write it to a file. Use this before 'admit' or 'prove' to catch basic errors. Faster than full evaluation but less thorough.",
+            description="Quickly check ACL2 code for syntax errors without full execution. Input is either inline code or an input_path file. By default the code is first balanced with parinfer (indent mode). On success, return the balanced source, write it to a different file (output_path/file_path), or rewrite the input file in place (in_place). Use this before 'admit' or 'prove' to catch basic errors. Faster than full evaluation but less thorough.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "ACL2 code to check",
+                        "description": "ACL2 code to check. Provide this or input_path (not both).",
+                    },
+                    "input_path": {
+                        "type": "string",
+                        "description": "Read the code from this file instead of passing code in the call",
                     },
                     "parinfer": {
                         "type": "boolean",
@@ -1009,20 +1125,28 @@ async def list_tools() -> list[Tool]:
                     },
                     "return_source": {
                         "type": "boolean",
-                        "description": "On success, return the balanced source instead of the usual diagnostics (default: false)",
+                        "description": "On success, return the balanced source instead of the usual diagnostics (default: false). Cannot be combined with writing to a file.",
                         "default": False,
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": "On success, write the balanced source to this path (a different file) and return a confirmation",
                     },
                     "file_path": {
                         "type": "string",
-                        "description": "On success, write the balanced source to this path and return a confirmation instead of the source",
+                        "description": "Alias for output_path, kept for backward compatibility",
+                    },
+                    "in_place": {
+                        "type": "boolean",
+                        "description": "On success, rewrite input_path with the balanced source (requires input_path; cannot be combined with output_path/file_path)",
+                        "default": False,
                     },
                     "overwrite": {
                         "type": "boolean",
-                        "description": "Allow replacing an existing file when file_path is given (default: false)",
+                        "description": "Allow replacing an existing output_path/file_path (default: false). in_place always replaces the input.",
                         "default": False,
                     },
                 },
-                "required": ["code"],
             },
         ),
         Tool(
@@ -1092,13 +1216,17 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="admit",
-            description="Test if an ACL2 event would be accepted WITHOUT saving it permanently. Use this to validate definitions/theorems before adding them to files. Faster than 'prove' for testing. Returns success/failure. Example use case: testing if a function definition is valid before committing to a file. Can optionally use a persistent session to test in context of existing definitions.",
+            description="Test if an ACL2 event would be accepted WITHOUT saving it permanently. Use this to validate definitions/theorems before adding them to files. Input is either an inline event or an input_path file. Faster than 'prove' for testing. Returns success/failure. Example use case: testing if a function definition is valid before committing to a file. Can optionally use a persistent session to test in context of existing definitions.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "Single ACL2 event to test. Example: (defun my-func (x) (+ x 1)) or (defthm my-thm (equal (+ 1 1) 2))",
+                        "description": "Single ACL2 event to test. Example: (defun my-func (x) (+ x 1)) or (defthm my-thm (equal (+ 1 1) 2)). Provide this or input_path (not both).",
+                    },
+                    "input_path": {
+                        "type": "string",
+                        "description": "Read the event to test from this file instead of passing code in the call",
                     },
                     "timeout": {
                         "type": "number",
@@ -1114,7 +1242,6 @@ async def list_tools() -> list[Tool]:
                         "description": "Override the session's parinfer setting for this call (default: session setting; true without a session)",
                     },
                 },
-                "required": ["code"],
             },
         ),
         Tool(
@@ -1239,7 +1366,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="retry_proof",
-            description="Retry the last proof attempt in a session with different hints or strategies. This is useful for interactive proof debugging - when a proof fails, you can try again with modified hints without re-submitting the entire theorem. Failed proofs do not change the ACL2 world, so no undo is needed; the new attempt is simply submitted.",
+            description="Retry the last proof attempt in a session with different hints or strategies. Input is either inline code or an input_path file. This is useful for interactive proof debugging - when a proof fails, you can try again with modified hints without re-submitting the entire theorem. Failed proofs do not change the ACL2 world, so no undo is needed; the new attempt is simply submitted.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1249,7 +1376,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "code": {
                         "type": "string",
-                        "description": "New proof attempt with different hints. Example: (defthm my-thm (equal x y) :hints ((\"Goal\" :use (:instance lemma))))",
+                        "description": "New proof attempt with different hints. Example: (defthm my-thm (equal x y) :hints ((\"Goal\" :use (:instance lemma)))). Provide this or input_path (not both).",
+                    },
+                    "input_path": {
+                        "type": "string",
+                        "description": "Read the new proof attempt from this file instead of passing code in the call",
                     },
                     "timeout": {
                         "type": "number",
@@ -1257,18 +1388,22 @@ async def list_tools() -> list[Tool]:
                         "default": 60,
                     },
                 },
-                "required": ["session_id", "code"],
+                "required": ["session_id"],
             },
         ),
         Tool(
             name="parinfer",
-            description="Balance Lisp/ACL2 parentheses and indentation with parinfer. Indent mode is the default: parentheses are derived from indentation, which suits code written in bulk (LLMs are usually good at indentation but miss parens). Use 'paren' mode to validate existing parens and fix indentation instead.",
+            description="Balance Lisp/ACL2 parentheses and indentation with parinfer. Input is either inline code or an input_path file. Indent mode is the default: parentheses are derived from indentation, which suits code written in bulk (LLMs are usually good at indentation but miss parens). Use 'paren' mode to validate existing parens and fix indentation instead. Returns the balanced source, or writes it to a different file (output_path/file_path) or back to the input file (in_place).",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "Lisp/ACL2 source to balance",
+                        "description": "Lisp/ACL2 source to balance. Provide this or input_path (not both).",
+                    },
+                    "input_path": {
+                        "type": "string",
+                        "description": "Read the source from this file instead of passing code in the call",
                     },
                     "mode": {
                         "type": "string",
@@ -1281,8 +1416,25 @@ async def list_tools() -> list[Tool]:
                         "description": "Language dialect. Only 'lisp' is supported, which matches ACL2 (vline symbols and block comments enabled; quotes in ';' comments ignored).",
                         "default": "lisp",
                     },
+                    "output_path": {
+                        "type": "string",
+                        "description": "On success, write the balanced source to this path (a different file) and return a confirmation",
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Alias for output_path, kept for backward compatibility",
+                    },
+                    "in_place": {
+                        "type": "boolean",
+                        "description": "On success, rewrite input_path with the balanced source (requires input_path; cannot be combined with output_path/file_path)",
+                        "default": False,
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Allow replacing an existing output_path/file_path (default: false). in_place always replaces the input.",
+                        "default": False,
+                    },
                 },
-                "required": ["code"],
             },
         ),
         Tool(
@@ -1866,8 +2018,17 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 
     elif name == "retry_proof":
         session_id = arguments["session_id"]
-        code = arguments["code"]
         timeout = arguments.get("timeout", 60)
+
+        try:
+            code, _ = read_source_argument(arguments)
+        except ValueError as e:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: {e}",
+                )
+            ]
 
         session = session_manager.get_session(session_id)
         if not session:
@@ -1890,9 +2051,18 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         ]
 
     elif name == "prove":
-        code = arguments["code"]
         timeout = arguments.get("timeout", 30)
         session_id = arguments.get("session_id")
+
+        try:
+            code, _ = read_source_argument(arguments)
+        except ValueError as e:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: {e}",
+                )
+            ]
 
         session = None
         if session_id:
@@ -1932,9 +2102,18 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         ]
 
     elif name == "evaluate":
-        code = arguments["code"]
         timeout = arguments.get("timeout", 30)
         session_id = arguments.get("session_id")
+
+        try:
+            code, _ = read_source_argument(arguments)
+        except ValueError as e:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: {e}",
+                )
+            ]
 
         session = None
         if session_id:
@@ -1974,17 +2153,26 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         ]
 
     elif name == "check_syntax":
-        code = arguments["code"]
         use_parinfer = arguments.get("parinfer", True)
         return_source = bool(arguments.get("return_source", False))
-        file_path = arguments.get("file_path")
-        overwrite = bool(arguments.get("overwrite", False))
 
-        if file_path and return_source:
+        # Input is either inline code or a file; output is optional.
+        try:
+            code, input_abs = read_source_argument(arguments)
+            destination = resolve_write_destination(arguments, input_abs)
+        except ValueError as e:
             return [
                 TextContent(
                     type="text",
-                    text="Error: file_path and return_source are mutually exclusive; choose one.",
+                    text=f"Error: {e}",
+                )
+            ]
+
+        if return_source and destination is not None:
+            return [
+                TextContent(
+                    type="text",
+                    text="Error: return_source cannot be combined with writing to a file; choose one.",
                 )
             ]
 
@@ -2027,16 +2215,17 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         is_syntax_error = any(pattern in output_lower for pattern in syntax_error_patterns)
 
         if is_syntax_error:
+            source_note = f" in {input_abs}" if input_abs is not None else ""
             return [
                 TextContent(
                     type="text",
-                    text=f"Syntax errors found:\n\n{output}",
+                    text=f"Syntax errors found{source_note}:\n\n{output}",
                 )
             ]
 
-        if file_path:
+        if destination is not None:
             try:
-                out_path = validate_output_path(file_path, overwrite=overwrite)
+                confirmation = write_balanced_source(destination, balanced)
             except ValueError as e:
                 return [
                     TextContent(
@@ -2044,23 +2233,10 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                         text=f"Error: {e}",
                     )
                 ]
-
-            source = balanced if balanced.endswith("\n") else balanced + "\n"
-            try:
-                out_path.write_text(source, encoding="utf-8")
-            except OSError as e:
-                return [
-                    TextContent(
-                        type="text",
-                        text=f"Error: could not write {out_path.name}: {e}",
-                    )
-                ]
-
             return [
                 TextContent(
                     type="text",
-                    text=f"Wrote {len(source.splitlines())} lines "
-                    f"({len(source)} characters) to {out_path}.",
+                    text=confirmation,
                 )
             ]
 
@@ -2072,10 +2248,11 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
+        source_note = f" in {input_abs}" if input_abs is not None else ""
         return [
             TextContent(
                 type="text",
-                text="No syntax errors detected.\n\n" + output,
+                text=f"No syntax errors detected{source_note}.\n\n" + output,
             )
         ]
 
@@ -2186,9 +2363,18 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         ]
 
     elif name == "admit":
-        code = arguments["code"]
         timeout = arguments.get("timeout", 30)
         session_id = arguments.get("session_id")
+
+        try:
+            code, _ = read_source_argument(arguments)
+        except ValueError as e:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: {e}",
+                )
+            ]
 
         session = None
         if session_id:
@@ -2258,7 +2444,6 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         ]
 
     elif name == "parinfer":
-        code = arguments["code"]
         mode = arguments.get("mode", DEFAULT_PARINFER_MODE)
         language = arguments.get("language", "lisp")
 
@@ -2278,11 +2463,14 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        if len(code) > MAX_CODE_LENGTH:
+        try:
+            code, input_abs = read_source_argument(arguments)
+            destination = resolve_write_destination(arguments, input_abs)
+        except ValueError as e:
             return [
                 TextContent(
                     type="text",
-                    text=f"Error: Code exceeds maximum length of {MAX_CODE_LENGTH} characters",
+                    text=f"Error: {e}",
                 )
             ]
 
@@ -2301,6 +2489,23 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 TextContent(
                     type="text",
                     text=f"Error: parinfer failed: {error}",
+                )
+            ]
+
+        if destination is not None:
+            try:
+                confirmation = write_balanced_source(destination, balanced)
+            except ValueError as e:
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Error: {e}",
+                    )
+                ]
+            return [
+                TextContent(
+                    type="text",
+                    text=confirmation,
                 )
             ]
 
