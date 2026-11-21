@@ -106,6 +106,29 @@ def escape_acl2_string(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def command_number_probe(marker: str) -> str:
+    """
+    Build an ACL2 form that prints MARKER followed by the current command number.
+
+    Counting submissions is not the same as counting world events: failed
+    proofs, :ubt, :pbt, and multi-event commands all change the picture.  Ask
+    ACL2 for its own (relative) command number instead.  The marker is printed
+    on its own line so callers can strip it from the output.
+
+    Args:
+        marker: Unique marker string to print before the number
+
+    Returns:
+        ACL2 form suitable for sending to a session
+    """
+    return (
+        f'(acl2::cw "~%{marker}~x0~%" '
+        "(acl2::absolute-to-relative-command-number "
+        "(acl2::max-absolute-command-number (acl2::w acl2::state)) "
+        "(acl2::w acl2::state)))"
+    )
+
+
 def validate_file_path(file_path: str) -> Path:
     """
     Validate file path and check it exists.
@@ -134,6 +157,41 @@ def validate_file_path(file_path: str) -> Path:
         raise ValueError(f"Path is not a file: {abs_path.name}")
 
     return abs_path
+
+
+def resolve_book_reference(file_path: str) -> tuple[str, bool]:
+    """
+    Resolve a book argument to what should be handed to ACL2's include-book.
+
+    Returns:
+        Tuple of (book_reference, is_local_file).  An existing .lisp or .cert
+        file resolves to an absolute path (without extension).  A name that is
+        not a local file is passed through unchanged so ACL2 can resolve it
+        against its own book directories (and gets :dir :system).
+
+    Raises:
+        ValueError: If the path is empty or an absolute path that is not a file
+    """
+    raw = file_path[:-len(".lisp")] if file_path.lower().endswith(".lisp") else file_path
+    if not raw.strip():
+        raise ValueError("Book path cannot be empty")
+
+    path = Path(raw).expanduser()
+    for candidate in (Path(f"{raw}.lisp"), Path(f"{raw}.cert")):
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if resolved.exists():
+            if not resolved.is_file():
+                raise ValueError(f"Path is not a file: {resolved.name}")
+            return str(resolved.with_suffix("")), True
+
+    if path.is_absolute():
+        raise ValueError(f"File not found: {path.name}")
+
+    # Not a local file: let ACL2 look in its system book directory.
+    return raw, False
 
 
 def validate_output_path(file_path: str, overwrite: bool = False) -> Path:
@@ -388,6 +446,32 @@ class ACL2Session:
     parinfer_mode: str = DEFAULT_PARINFER_MODE
     accepted_code: list[str] = field(default_factory=list)
     accepted_code_size: int = 0
+    alive: bool = True
+
+    def is_alive(self) -> bool:
+        """Whether the underlying ACL2 process can still accept commands."""
+        return self.alive and self.process.returncode is None
+
+    def prune_checkpoints_after(self, event_number: int, keep: Optional[str] = None) -> None:
+        """Drop checkpoints that a backtrack has made unreachable."""
+        for name in list(self.checkpoints):
+            if name != keep and self.checkpoints[name].event_number > event_number:
+                logger.info(
+                    f"Session {self.session_id}: dropping unreachable checkpoint {name!r} "
+                    f"(saved at event {self.checkpoints[name].event_number}, now at {event_number})"
+                )
+                del self.checkpoints[name]
+
+    def _record_command_number(self, line: str, marker: str) -> bool:
+        """Parse the command number printed with a marker; return whether it parsed."""
+        match = re.match(r"\s*(\d+)", line.split(marker, 1)[1])
+        if match is None:
+            logger.warning(
+                f"Session {self.session_id}: could not parse command number from marker line"
+            )
+            return False
+        self.event_counter = int(match.group(1))
+        return True
 
     async def send_command(self, command: str, timeout: int = 30) -> str:
         """
@@ -402,6 +486,10 @@ class ACL2Session:
         """
         async with self.lock:
             self.last_activity = time.time()
+
+            if not self.is_alive():
+                self.alive = False
+                return "Error: Session process has terminated (connection lost)."
 
             if self.process.stdin is None or self.process.stdout is None:
                 return "Error: Session process has no stdin/stdout"
@@ -433,6 +521,7 @@ class ACL2Session:
                                     timeout=1.0
                                 )
                                 if not line:
+                                    self.alive = False
                                     return "Error: Session process terminated during startup"
                                 lines_read += 1
                                 if banner_marker in line.decode():
@@ -442,24 +531,34 @@ class ACL2Session:
                                 continue
                         self.banner_consumed = True
                     except (BrokenPipeError, ConnectionResetError):
+                        self.alive = False
                         return "Error: Session connection lost during startup"
 
-                # SECURITY: Use cryptographically random marker to prevent injection
-                marker = f"___MARKER_{uuid.uuid4().hex}_{uuid.uuid4().hex}___"
+                # SECURITY: Use cryptographically random marker to prevent injection.
+                # The marker form also reports ACL2's current command number, so
+                # event_counter mirrors the real world even across failed proofs,
+                # :ubt/:pbt, and commands that create several events.
+                # Keep it short: ACL2's fmt wraps ~x0 to a new line when the
+                # marker nearly fills the right margin, which would split the
+                # number from the marker.
+                marker = f"__M_{uuid.uuid4().hex}__"
+                marker_form = command_number_probe(marker)
                 
                 # Send command and marker together
                 # The marker is sent immediately after the command so we can detect completion
                 try:
                     self.process.stdin.write(f"{command}\n".encode())
-                    self.process.stdin.write(f'(cw "~%{marker}~%")\n'.encode())
+                    self.process.stdin.write(f"{marker_form}\n".encode())
                     await self.process.stdin.drain()
                 except (BrokenPipeError, ConnectionResetError):
+                    self.alive = False
                     return "Error: Session connection lost (broken pipe)"
 
                 # Read response with timeout
                 output_lines = []
                 start_time = time.time()
                 marker_found = False
+                reported_command_number = False
                 abort_detected = False
 
                 try:
@@ -474,13 +573,18 @@ class ACL2Session:
                                 timeout=min(remaining, 1.0)
                             )
                             if not line:  # EOF
+                                self.alive = False
                                 return "Error: Session process terminated unexpectedly"
                             decoded_line = line.decode()
-                            output_lines.append(decoded_line)
 
                             if marker in decoded_line:
+                                reported_command_number = self._record_command_number(
+                                    decoded_line, marker
+                                )
                                 marker_found = True
                                 break
+
+                            output_lines.append(decoded_line)
                             
                             # Detect ACL2 abort - marker won't come after this
                             if "ABORTING from raw Lisp" in decoded_line:
@@ -512,10 +616,14 @@ class ACL2Session:
                                                 output_lines.append(decoded)
                                             if recovery_marker in decoded:
                                                 marker_found = True
+                                                # An aborted command may not have changed
+                                                # the world; keep the last known number.
+                                                reported_command_number = True
                                                 break
                                         except asyncio.TimeoutError:
                                             continue
                                 except (BrokenPipeError, ConnectionResetError):
+                                    self.alive = False
                                     pass
                                 break
                             continue
@@ -526,10 +634,19 @@ class ACL2Session:
                 except Exception:
                     return "Error: Session communication failed"
 
-                self.event_counter += 1
-                return "".join(output_lines).replace(marker, "").strip()
+                output = "".join(output_lines).replace(marker, "").strip()
+
+                if not reported_command_number:
+                    # Fallback for ACL2 builds without the command-number
+                    # accessor: assume a successful non-session command added
+                    # one event.
+                    if not command.lstrip().startswith(":") and not acl2_output_failed(output):
+                        self.event_counter += 1
+
+                return output
 
             except (BrokenPipeError, ConnectionResetError):
+                self.alive = False
                 # SECURITY: Don't leak internal details in error messages
                 return "Error: Session connection lost (broken pipe)"
             except Exception:
@@ -549,6 +666,7 @@ class ACL2Session:
 
     async def terminate(self) -> None:
         """Terminate the ACL2 session."""
+        self.alive = False
         try:
             if self.process.stdin:
                 try:
@@ -698,16 +816,21 @@ class SessionManager:
             age = time.time() - session.created_at
             idle = time.time() - session.last_activity
             name_str = f" ({session.name})" if session.name else ""
+            status = "" if session.is_alive() else " [terminated]"
             lines.append(
                 f"  {session_id}{name_str}: "
                 f"age={age:.0f}s, idle={idle:.0f}s, events={session.event_counter}, "
-                f"parinfer={'on' if session.parinfer_enabled else 'off'}"
+                f"parinfer={'on' if session.parinfer_enabled else 'off'}{status}"
             )
 
         return "\n".join(lines)
 
     def get_session(self, session_id: str) -> Optional[ACL2Session]:
-        """Get a session by ID."""
+        """Get a session by ID.
+
+        Dead sessions are returned (and flagged in list_sessions) so callers
+        get a precise "terminated" error; the cleanup task reaps them.
+        """
         return self.sessions.get(session_id)
 
     async def cleanup_all(self) -> None:
@@ -741,7 +864,8 @@ class SessionManager:
                 sessions_snapshot = list(self.sessions.items())
 
                 for session_id, session in sessions_snapshot:
-                    if now - session.last_activity > SESSION_INACTIVITY_TIMEOUT:
+                    if (not session.is_alive()
+                            or now - session.last_activity > SESSION_INACTIVITY_TIMEOUT):
                         to_remove.append((session_id, session))
 
                 # SECURITY: Check if session still exists before removing
@@ -1115,7 +1239,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="retry_proof",
-            description="Retry the last proof attempt in a session with different hints or strategies. This is useful for interactive proof debugging - when a proof fails, you can try again with modified hints without re-submitting the entire theorem. The previous failed proof attempt is undone first.",
+            description="Retry the last proof attempt in a session with different hints or strategies. This is useful for interactive proof debugging - when a proof fails, you can try again with modified hints without re-submitting the entire theorem. Failed proofs do not change the ACL2 world, so no undo is needed; the new attempt is simply submitted.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1360,20 +1484,21 @@ async def include_acl2_book(file_path: str, additional_code: str = "", timeout: 
     Returns:
         Output from ACL2
     """
-    # Remove .lisp extension if present
-    book_path = str(Path(file_path).with_suffix(""))
-    lisp_path = Path(book_path).with_suffix(".lisp")
-
+    # Resolve the book reference: a local file becomes an absolute path;
+    # anything else is left for ACL2 to find among its system books.
     try:
-        abs_path = validate_file_path(str(lisp_path))
+        book_ref, is_local = resolve_book_reference(file_path)
     except ValueError as e:
         return f"Error: {e}"
 
     # Escape the book path for safe use in ACL2 code
-    escaped_book_path = escape_acl2_string(book_path)
+    escaped_book_path = escape_acl2_string(book_ref)
 
     # Build code to include book and run additional commands
-    code = f'(include-book "{escaped_book_path}")'
+    if is_local:
+        code = f'(include-book "{escaped_book_path}")'
+    else:
+        code = f'(include-book "{escaped_book_path}" :dir :system)'
     if additional_code.strip():
         # Validate additional code length
         if len(additional_code) > MAX_CODE_LENGTH:
@@ -1523,19 +1648,49 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        # Use ACL2's :ubt to undo
-        # SECURITY: Ensure undo_count is within valid range
-        undo_count = max(0, min(session.event_counter - count, session.event_counter))
-        if undo_count < 0:
-            undo_count = 0
+        # :ubt n undoes the commands from the most recent one back through n.
+        # To remove `count` events ending at the current event E we must target
+        # E - count + 1 (event 0 is system initialization and cannot be undone).
+        current = session.event_counter
+        if current <= 0:
+            return [
+                TextContent(
+                    type="text",
+                    text="Error: There are no events to undo in this session.",
+                )
+            ]
+        if count > current:
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Error: Cannot undo {count} event(s); the session has only "
+                        f"{current} event(s)."
+                    ),
+                )
+            ]
 
-        output = await session.send_command(f":ubt {undo_count}")
-        session.event_counter = undo_count
+        target = current - count + 1
+        output = await session.send_command(f":ubt {target}")
+
+        if acl2_output_failed(output):
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: Undo failed; the session is still at event "
+                    f"{session.event_counter}.\n\n{output}",
+                )
+            ]
+
+        session.prune_checkpoints_after(session.event_counter)
 
         return [
             TextContent(
                 type="text",
-                text=f"Undone {count} event(s):\n\n{output}",
+                text=(
+                    f"Undone {count} event(s); the session is now at event "
+                    f"{session.event_counter}.\n\n{output}"
+                ),
             )
         ]
 
@@ -1620,14 +1775,55 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        # Restore to checkpoint by undoing to that event number
-        output = await session.send_command(f":ubt {checkpoint.event_number}")
-        session.event_counter = checkpoint.event_number
+        # :ubt n removes command n itself, so keep the checkpoint's event by
+        # undoing back through the command *after* it.  A checkpoint above the
+        # current event is unreachable (something was undone past it).
+        current = session.event_counter
+        if checkpoint.event_number > current:
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Error: Checkpoint '{checkpoint_name}' was saved at event "
+                        f"{checkpoint.event_number}, but the session is now at event "
+                        f"{current}; restore to an earlier state first."
+                    ),
+                )
+            ]
+
+        if checkpoint.event_number == current:
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Session is already at checkpoint '{checkpoint_name}' "
+                        f"(event {checkpoint.event_number})."
+                    ),
+                )
+            ]
+
+        output = await session.send_command(f":ubt {checkpoint.event_number + 1}")
+
+        if acl2_output_failed(output):
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Error: Restore to checkpoint '{checkpoint_name}' failed; the "
+                        f"session is still at event {session.event_counter}.\n\n{output}"
+                    ),
+                )
+            ]
+
+        session.prune_checkpoints_after(session.event_counter, keep=checkpoint_name)
 
         return [
             TextContent(
                 type="text",
-                text=f"Restored to checkpoint '{checkpoint_name}' (event {checkpoint.event_number}):\n\n{output}",
+                text=(
+                    f"Restored to checkpoint '{checkpoint_name}' (event "
+                    f"{session.event_counter}):\n\n{output}"
+                ),
             )
         ]
 
@@ -1655,9 +1851,10 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        # Use ACL2's :pbt to show recent events
-        # SECURITY: Ensure start_event is non-negative
-        start_event = max(0, session.event_counter - limit)
+        # Use ACL2's :pbt to show recent events.  :pbt prints from start_event
+        # through the current command, so include the current event itself in
+        # the requested window (and clamp to event 0).
+        start_event = max(0, session.event_counter - limit + 1)
         output = await session.send_command(f":pbt {start_event}")
 
         return [
@@ -1681,12 +1878,8 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        # Undo the last failed proof attempt
-        if session.event_counter > 0:
-            await session.send_command(f":ubt {session.event_counter - 1}")
-            session.event_counter -= 1
-
-        # Try the new proof
+        # A failed proof does not add an event, so there is nothing to undo.
+        # (Undoing here used to delete the last *successful* event instead.)
         output = await session.send_command(code, timeout)
 
         return [
@@ -1922,6 +2115,12 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         try:
             abs_path = validate_file_path(file_path)
             validated_theorem = validate_acl2_identifier(theorem_name)
+            # The name is used as a bare ACL2 symbol (in 'name and as a
+            # command descriptor), so reject anything needing |...| quoting.
+            if not re.match(r"^[A-Za-z0-9!$%&*+\-./:<=>?@^_~]+$", validated_theorem):
+                raise ValueError(
+                    f"Theorem name must be a plain ACL2 symbol: {theorem_name}"
+                )
         except ValueError as e:
             return [
                 TextContent(
@@ -1932,13 +2131,52 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 
         # Escape the path and build code
         escaped_path = escape_acl2_string(str(abs_path))
-        
-        # Get the directory containing the file (for .acl2 file lookup)
+
+        # Get the directory containing the file (for .lisp/.acl2 lookup)
         file_dir = str(Path(abs_path).parent)
 
-        # First load the file, then try to prove the theorem by name
-        code = f'(ld "{escaped_path}")\n(thm (implies t ({validated_theorem})))'
+        # Load the file, stash the named event's form in a state global (these
+        # survive :ubt), undo back through that event, then re-submit the form.
+        # Undoing the event first means the re-proof cannot lean on the very
+        # theorem being checked; re-reading the stored form preserves hints.
+        check_var = "acl2::acl2-mcp-check-event"
+        no_event_marker = "___ACL2_MCP_NO_SUCH_EVENT___"
+        undo_failed_marker = "___ACL2_MCP_UNDO_FAILED___"
+        code = (
+            f'(ld "{escaped_path}")\n'
+            f"(acl2::assign {check_var} "
+            f"(acl2::get-event '{validated_theorem} (acl2::w acl2::state)))\n"
+            f":ubt {validated_theorem}\n"
+            f"(acl2::if (acl2::@ {check_var})\n"
+            f"    (acl2::if (acl2::get-event '{validated_theorem} (acl2::w acl2::state))\n"
+            f'        (acl2::cw "{undo_failed_marker}~%")\n'
+            f"      (acl2::ld (acl2::list (acl2::@ {check_var}))))\n"
+            f'    (acl2::cw "{no_event_marker}~%"))'
+        )
         output = await run_acl2(code, timeout, cwd=file_dir)
+
+        if no_event_marker in output:
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Error: No event named '{validated_theorem}' was introduced "
+                        f"by {abs_path}."
+                    ),
+                )
+            ]
+
+        if undo_failed_marker in output:
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Error: Could not undo the event '{validated_theorem}' "
+                        f"(it may come from an included book rather than {abs_path.name}).\n\n"
+                        f"{output}"
+                    ),
+                )
+            ]
 
         return [
             TextContent(
