@@ -505,9 +505,8 @@ async def test_broken_pipe_on_send_command() -> None:
     session = session_manager.get_session(session_id)
     assert session is not None
 
-    # Kill the ACL2 process
-    session.process.kill()
-    await session.process.wait()
+    # Kill the ACL2 kernel process
+    session.kernel.km.shutdown_kernel(now=True)
 
     # Try to send a command (should get broken pipe error)
     result = await call_tool("evaluate", {
@@ -533,9 +532,8 @@ async def test_broken_pipe_on_terminate() -> None:
     session = session_manager.get_session(session_id)
     assert session is not None
 
-    # Kill the ACL2 process
-    session.process.kill()
-    await session.process.wait()
+    # Kill the ACL2 kernel process
+    session.kernel.km.shutdown_kernel(now=True)
 
     # Terminate should handle the broken pipe gracefully
     result = await call_tool("end_session", {"session_id": session_id})
@@ -558,8 +556,7 @@ async def test_cleanup_all_with_dead_sessions() -> None:
     for session_id in session_ids[:2]:
         session = session_manager.get_session(session_id)
         if session:
-            session.process.kill()
-            await session.process.wait()
+            session.kernel.km.shutdown_kernel(now=True)
 
     # cleanup_all should handle this gracefully
     await session_manager.cleanup_all()
@@ -581,12 +578,7 @@ async def test_eof_detection() -> None:
 
     # Send a command that will cause the process to exit
     # (good-bye exits ACL2)
-    if session.process.stdin:
-        try:
-            session.process.stdin.write(b"(good-bye)\n")
-            await session.process.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+    session.kernel.km.shutdown_kernel(now=True)
 
     # Wait a bit for process to exit
     await asyncio.sleep(0.5)

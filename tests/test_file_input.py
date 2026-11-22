@@ -91,8 +91,8 @@ async def test_retry_proof_reads_input_path(tmp_path: Path) -> None:
                 "get_world_state", {"session_id": session_id, "limit": 10}
             )
         )
-        assert "KEEPS-EXISTING" in world, world
-        assert "FROM-FILE-THM" in world, world
+        assert "KEEPS-EXISTING" in world.upper(), world
+        assert "FROM-FILE-THM" in world.upper(), world
     finally:
         await call_tool("end_session", {"session_id": session_id})
 

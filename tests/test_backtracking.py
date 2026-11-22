@@ -53,8 +53,8 @@ async def test_undo_removes_exactly_the_requested_events() -> None:
         assert "now at event 1" in text, text
 
         world = await _world(session_id)
-        assert "FUNC-A" in world, world
-        assert "FUNC-B" not in world, world
+        assert "FUNC-A" in world.upper(), world
+        assert "FUNC-B" not in world.upper(), world
     finally:
         await _end(session_id)
 
@@ -72,7 +72,7 @@ async def test_undo_more_than_available_is_rejected() -> None:
 
         # The failed request must not have disturbed the world.
         world = await _world(session_id)
-        assert "ONLY-FUNC" in world, world
+        assert "ONLY-FUNC" in world.upper(), world
     finally:
         await _end(session_id)
 
@@ -109,8 +109,8 @@ async def test_restore_checkpoint_keeps_the_checkpoint_event() -> None:
         assert "event 1" in text, text
 
         world = await _world(session_id)
-        assert "KEEP-ME" in world, world
-        assert "DROP-ME" not in world, world
+        assert "KEEP-ME" in world.upper(), world
+        assert "DROP-ME" not in world.upper(), world
     finally:
         await _end(session_id)
 
@@ -132,7 +132,7 @@ async def test_restore_when_already_there_is_a_no_op() -> None:
         assert "already at checkpoint 'here'" in restore[0].text, restore[0].text
 
         world = await _world(session_id)
-        assert "STAY-PUT" in world, world
+        assert "STAY-PUT" in world.upper(), world
     finally:
         await _end(session_id)
 
@@ -146,8 +146,8 @@ async def test_get_world_state_with_limit_one() -> None:
 
         world = await _world(session_id, limit=1)
         assert "ACL2 Error" not in world, world
-        assert "LAST-FUNC" in world, world
-        assert "FIRST-FUNC" not in world, world
+        assert "LAST-FUNC" in world.upper(), world
+        assert "FIRST-FUNC" not in world.upper(), world
     finally:
         await _end(session_id)
 
@@ -177,8 +177,8 @@ async def test_retry_proof_keeps_the_previous_successful_event() -> None:
         assert "ACL2 Error" not in retried[0].text, retried[0].text
 
         world = await _world(session_id)
-        assert "BEFORE-FAILURE" in world, world
-        assert "SUCCEEDING-THM" in world, world
+        assert "BEFORE-FAILURE" in world.upper(), world
+        assert "SUCCEEDING-THM" in world.upper(), world
     finally:
         await _end(session_id)
 
@@ -242,9 +242,7 @@ async def test_dead_session_is_reaped() -> None:
     session = session_manager.get_session(session_id)
     assert session is not None
 
-    session.process.kill()
-    await session.process.wait()
-    # Give the child watcher a moment to publish the return code.
+    session.kernel.km.shutdown_kernel(now=True)
     await asyncio.sleep(0.2)
 
     result = await call_tool(

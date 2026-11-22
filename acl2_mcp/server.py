@@ -7,30 +7,49 @@ import logging
 import os
 import re
 import signal
-import subprocess
-import tempfile
 import threading
 import time
 import uuid
-from collections import deque
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Any, Sequence, Optional
 from dataclasses import dataclass, field
 
+from .kernel_backend import (
+    CellResult,
+    KernelClient,
+    KernelConfigError,
+    KernelDied,
+    KernelStartError,
+    KernelTimeout,
+    check_syntax_once,
+    execute_once,
+    resolve_kernel_name,
+)
+
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ListToolsResult, CallToolResult
 
-# Set up file logging for debugging
+# Set up file logging for debugging (ACL2_MCP_LOG_FILE overrides the path).
+_log_file = os.environ.get("ACL2_MCP_LOG_FILE", "/tmp/acl2-mcp-debug.log")
+try:
+    _file_handler = logging.FileHandler(_log_file)
+    _file_handler.setLevel(logging.DEBUG)
+    _stream_handler = logging.StreamHandler()
+    _stream_handler.setLevel(logging.INFO)
+    _log_handlers: list[logging.Handler] = [_file_handler, _stream_handler]
+except OSError:
+    _log_handlers = [logging.StreamHandler()]
+
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('/tmp/acl2-mcp-debug.log'),
-        logging.StreamHandler()
-    ]
+    handlers=_log_handlers,
 )
+# Jupyter clients are chatty at DEBUG and would flood stderr.
+logging.getLogger("traitlets").setLevel(logging.WARNING)
+logging.getLogger("jupyter_client").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 try:
@@ -117,29 +136,6 @@ def escape_acl2_string(s: str) -> str:
     """
     # Escape backslashes first, then quotes
     return s.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def command_number_probe(marker: str) -> str:
-    """
-    Build an ACL2 form that prints MARKER followed by the current command number.
-
-    Counting submissions is not the same as counting world events: failed
-    proofs, :ubt, :pbt, and multi-event commands all change the picture.  Ask
-    ACL2 for its own (relative) command number instead.  The marker is printed
-    on its own line so callers can strip it from the output.
-
-    Args:
-        marker: Unique marker string to print before the number
-
-    Returns:
-        ACL2 form suitable for sending to a session
-    """
-    return (
-        f'(acl2::cw "~%{marker}~x0~%" '
-        "(acl2::absolute-to-relative-command-number "
-        "(acl2::max-absolute-command-number (acl2::w acl2::state)) "
-        "(acl2::w acl2::state)))"
-    )
 
 
 def validate_file_path(file_path: str) -> Path:
@@ -271,6 +267,8 @@ def read_source_argument(arguments: Any) -> tuple[str, Optional[Path]]:
             raise ValueError(
                 f"Source exceeds maximum length of {MAX_CODE_LENGTH} characters"
             )
+        if not code.strip():
+            raise ValueError(f"File is empty: {abs_path.name}")
         return code, abs_path
 
     if not isinstance(code, str):
@@ -279,6 +277,8 @@ def read_source_argument(arguments: Any) -> tuple[str, Optional[Path]]:
         raise ValueError(
             f"Code exceeds maximum length of {MAX_CODE_LENGTH} characters"
         )
+    if not code.strip():
+        raise ValueError("Source is empty")
     return code, None
 
 
@@ -482,8 +482,19 @@ def clean_acl2_output(output: str) -> str:
             output = output[prompt_at + len(ACL2_PROMPT) :]
 
     # Prompts appear at the start of a line (sometimes immediately before the
-    # value printed by the next top-level form).
+    # value printed by the next top-level form).  The kernel does not emit
+    # prompts, but ld-based code can still produce this block.
     output = re.sub(r"(?m)^ACL2 !>+", "", output)
+    output = re.sub(r"(?m)^ACL2 >+", "", output)
+    # (ld "file") prints a startup-like directory block and an ld trailer.
+    output = re.sub(
+        r"(?ms)^Project-dir-alist:\n.*?^Type \(quit\) to quit completely "
+        r"out of ACL2\.\n*",
+        "",
+        output,
+    )
+    output = re.sub(r"(?m)^Bye\.\s*$\n?", "", output)
+    output = re.sub(r"(?mi)^\s*:EOF\s*$\n?", "", output)
     lines = output.splitlines()
     # Remove blank lines left behind by the final prompt, but preserve
     # meaningful internal blank lines.
@@ -598,27 +609,25 @@ class AcceptedForm:
 
 @dataclass
 class ACL2Session:
-    """Represents a persistent ACL2 session."""
+    """A persistent ACL2 session backed by a Jupyter kernel process."""
     session_id: str
     name: Optional[str]
-    process: asyncio.subprocess.Process
+    kernel: KernelClient
     created_at: float
     last_activity: float
     checkpoints: dict[str, SessionCheckpoint] = field(default_factory=dict)
     event_counter: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    banner_consumed: bool = False
     parinfer_enabled: bool = True
     parinfer_mode: str = DEFAULT_PARINFER_MODE
     accepted_code: list[AcceptedForm] = field(default_factory=list)
     accepted_code_size: int = 0
     alive: bool = True
-    stderr_tail: deque[str] = field(default_factory=lambda: deque(maxlen=MAX_STDERR_LINES))
-    stderr_task: Optional[asyncio.Task[None]] = None
+    last_cell: Optional[CellResult] = None
 
     def is_alive(self) -> bool:
-        """Whether the underlying ACL2 process can still accept commands."""
-        return self.alive and self.process.returncode is None
+        """Whether the underlying ACL2 kernel can still accept commands."""
+        return self.alive and self.kernel.is_alive()
 
     def prune_checkpoints_after(self, event_number: int, keep: Optional[str] = None) -> None:
         """Drop checkpoints that a backtrack has made unreachable."""
@@ -640,277 +649,61 @@ class ACL2Session:
                 kept.append(form)
         self.accepted_code = kept
 
-    async def drain_stderr(self) -> None:
-        """Keep the stderr pipe drained so ACL2 cannot block on a full buffer."""
-        if self.process.stderr is None:
-            return
-        try:
-            while True:
-                line = await self.process.stderr.readline()
-                if not line:
-                    break
-                text = line.decode(errors="replace").rstrip()
-                self.stderr_tail.append(text)
-                logger.debug(f"Session {self.session_id} stderr: {text}")
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.debug(
-                f"Session {self.session_id}: stderr reader stopped",
-                exc_info=True,
-            )
-
-    async def _consume_prompt(self, timeout: float = 1.0) -> None:
-        """Consume the marker form's printed value and the following prompt.
-
-        The completion probe is a top-level form, so ACL2 prints its return
-        value (NIL) and then a fresh prompt after the marker line.  Leaving
-        those bytes in the pipe makes them look like the next command's output.
-        Best-effort: a failure here must not break the command.
-        """
-        if self.process.stdout is None:
-            return
-        try:
-            await asyncio.wait_for(
-                self.process.stdout.readuntil(ACL2_PROMPT.encode()), timeout=timeout
-            )
-        except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
-            pass
-        except Exception:
-            logger.debug(
-                f"Session {self.session_id}: could not consume trailing prompt",
-                exc_info=True,
-            )
-
-    async def terminate_after_timeout(self, timeout: int) -> str:
-        """Kill a session whose command timed out, to avoid reader desync."""
-        self.alive = False
-        try:
-            self.process.kill()
-        except ProcessLookupError:
-            pass
-        except Exception:
-            logger.debug(
-                f"Session {self.session_id}: kill after timeout failed",
-                exc_info=True,
-            )
-        try:
-            await asyncio.wait_for(self.process.wait(), timeout=5.0)
-        except Exception:
-            pass
-        return (
-            f"Error: Command execution timed out after {timeout} seconds. "
-            "The ACL2 process was terminated to avoid a desynchronized reader; "
-            "start a new session to continue."
-        )
-
-    def _record_command_number(self, line: str, marker: str) -> bool:
-        """Parse the command number printed with a marker; return whether it parsed."""
-        match = re.match(r"\s*(\d+)", line.split(marker, 1)[1])
-        if match is None:
-            logger.warning(
-                f"Session {self.session_id}: could not parse command number from marker line"
-            )
-            return False
-        self.event_counter = int(match.group(1))
-        return True
-
     async def send_command(self, command: str, timeout: int = 30) -> str:
-        """
-        Send a command to the ACL2 session and get response.
+        """Run COMMAND in the session kernel and return its output.
 
-        Args:
-            command: ACL2 command to execute
-            timeout: Timeout in seconds
-
-        Returns:
-            Output from ACL2
+        The session's event counter is refreshed from the kernel after every
+        command.  ACL2 evaluations do not create command numbers, so the probe
+        itself does not disturb history.
         """
         async with self.lock:
             self.last_activity = time.time()
-            starting_event = self.event_counter
 
             if not self.is_alive():
                 self.alive = False
                 return "Error: Session process has terminated (connection lost)."
 
-            if self.process.stdin is None or self.process.stdout is None:
-                return "Error: Session process has no stdin/stdout"
-
-            # SECURITY: Validate code length to prevent memory exhaustion
             if len(command) > MAX_CODE_LENGTH:
                 return f"Error: Command exceeds maximum length of {MAX_CODE_LENGTH} characters"
 
-            # SECURITY: Validate timeout
             timeout = validate_timeout(timeout)
+            before = self.event_counter
 
             try:
-                # On first command, consume the startup banner
-                if not self.banner_consumed:
-                    banner_marker = f"___BANNER_{uuid.uuid4().hex}___"
-                    logger.info(f"Session {self.session_id}: Consuming banner with marker {banner_marker[:20]}...")
-                    try:
-                        # Send a no-op to flush the banner
-                        self.process.stdin.write(f'(cw "~%{banner_marker}~%")\n'.encode())
-                        await self.process.stdin.drain()
-                        
-                        # Read and discard until we see our banner marker
-                        banner_start = time.time()
-                        lines_read = 0
-                        while time.time() - banner_start < 15:  # 15s timeout for startup
-                            try:
-                                line = await asyncio.wait_for(
-                                    self.process.stdout.readline(),
-                                    timeout=1.0
-                                )
-                                if not line:
-                                    self.alive = False
-                                    return "Error: Session process terminated during startup"
-                                lines_read += 1
-                                if banner_marker in line.decode():
-                                    logger.info(f"Session {self.session_id}: Banner consumed after {lines_read} lines")
-                                    # Consume the no-op's NIL value and prompt too.
-                                    await self._consume_prompt()
-                                    break
-                            except asyncio.TimeoutError:
-                                continue
-                        self.banner_consumed = True
-                    except (BrokenPipeError, ConnectionResetError):
-                        self.alive = False
-                        return "Error: Session connection lost during startup"
-
-                # SECURITY: Use cryptographically random marker to prevent injection.
-                # The marker form also reports ACL2's current command number, so
-                # event_counter mirrors the real world even across failed proofs,
-                # :ubt/:pbt, and commands that create several events.
-                # Keep it short: ACL2's fmt wraps ~x0 to a new line when the
-                # marker nearly fills the right margin, which would split the
-                # number from the marker.
-                marker = f"__M_{uuid.uuid4().hex}__"
-                marker_form = command_number_probe(marker)
-                
-                # Send command and marker together
-                # The marker is sent immediately after the command so we can detect completion
-                try:
-                    self.process.stdin.write(f"{command}\n".encode())
-                    self.process.stdin.write(f"{marker_form}\n".encode())
-                    await self.process.stdin.drain()
-                except (BrokenPipeError, ConnectionResetError):
-                    self.alive = False
-                    return "Error: Session connection lost (broken pipe)"
-
-                # Read response with timeout
-                output_lines = []
-                start_time = time.time()
-                marker_found = False
-                reported_command_number = False
-                abort_detected = False
-
-                try:
-                    while time.time() - start_time < timeout:
-                        remaining = timeout - (time.time() - start_time)
-                        if remaining <= 0:
-                            break
-
-                        try:
-                            line = await asyncio.wait_for(
-                                self.process.stdout.readline(),
-                                timeout=min(remaining, 1.0)
-                            )
-                            if not line:  # EOF
-                                self.alive = False
-                                return "Error: Session process terminated unexpectedly"
-                            decoded_line = line.decode()
-
-                            if marker in decoded_line:
-                                reported_command_number = self._record_command_number(
-                                    decoded_line, marker
-                                )
-                                marker_found = True
-                                break
-
-                            output_lines.append(decoded_line)
-                            
-                            # Detect ACL2 abort - marker won't come after this
-                            if "ABORTING from raw Lisp" in decoded_line:
-                                abort_detected = True
-                                logger.info(f"Session {self.session_id}: Abort detected, will collect remaining output")
-                                
-                        except asyncio.TimeoutError:
-                            # If abort was detected and we hit timeout, ACL2 is waiting at prompt
-                            # Send a marker to flush remaining output
-                            if abort_detected:
-                                logger.info(f"Session {self.session_id}: Sending recovery marker after abort")
-                                recovery_marker = f"___RECOVERY_{uuid.uuid4().hex}___"
-                                try:
-                                    self.process.stdin.write(f'(cw "~%{recovery_marker}~%")\n'.encode())
-                                    await self.process.stdin.drain()
-                                    
-                                    # Read until we find the recovery marker
-                                    recovery_start = time.time()
-                                    while time.time() - recovery_start < 3:
-                                        try:
-                                            extra = await asyncio.wait_for(
-                                                self.process.stdout.readline(),
-                                                timeout=0.5
-                                            )
-                                            if not extra:
-                                                break
-                                            decoded = extra.decode()
-                                            if recovery_marker not in decoded:
-                                                output_lines.append(decoded)
-                                            if recovery_marker in decoded:
-                                                marker_found = True
-                                                # An aborted command may not have changed
-                                                # the world; keep the last known number.
-                                                reported_command_number = True
-                                                await self._consume_prompt()
-                                                break
-                                        except asyncio.TimeoutError:
-                                            continue
-                                except (BrokenPipeError, ConnectionResetError):
-                                    self.alive = False
-                                    pass
-                                break
-                            continue
-
-                    if not marker_found:
-                        return await self.terminate_after_timeout(timeout)
-
-                    # Consume the probe form's return value and the prompt so
-                    # they do not leak into the next command's output.
-                    await self._consume_prompt()
-
-                except Exception:
-                    return "Error: Session communication failed"
-
-                output = clean_acl2_output(
-                    "".join(output_lines).replace(marker, "")
-                )
-
-                if not reported_command_number:
-                    # Fallback for ACL2 builds without the command-number
-                    # accessor: assume a successful non-session command added
-                    # one event.
-                    if not command.lstrip().startswith(":") and not acl2_output_failed(output):
-                        self.event_counter += 1
-
-                # A backtrack (undo, checkpoint restore, or a raw :ubt sent
-                # through evaluate) invalidates checkpoints and exported forms
-                # above the new event count.
-                if self.event_counter < starting_event:
-                    self.prune_checkpoints_after(self.event_counter)
-                    self.prune_accepted_after(self.event_counter)
-
-                return output
-
-            except (BrokenPipeError, ConnectionResetError):
+                result = await asyncio.to_thread(self.kernel.execute, command, timeout)
+            except KernelTimeout as exc:
                 self.alive = False
-                # SECURITY: Don't leak internal details in error messages
-                return "Error: Session connection lost (broken pipe)"
+                return f"Error: {exc}"
+            except (KernelDied, KernelConfigError, KernelStartError) as exc:
+                self.alive = False
+                return f"Error: {exc}"
             except Exception:
-                # SECURITY: Don't leak internal details in error messages
+                logger.exception(
+                    f"Session {self.session_id}: unexpected kernel failure"
+                )
+                self.alive = False
                 return "Error: Failed to execute command in session"
+
+            self.last_cell = result
+
+            try:
+                self.event_counter = await asyncio.to_thread(
+                    self.kernel.command_number, 10
+                )
+            except Exception:
+                # Fall back to the metadata diff if the probe cannot run.
+                self.event_counter = before + len(result.events)
+
+            if self.event_counter < before:
+                self.prune_checkpoints_after(self.event_counter)
+                self.prune_accepted_after(self.event_counter)
+
+            text = clean_acl2_output(result.text)
+            if result.error and not text.startswith("Error:"):
+                ename = result.error.get("ename", "Error")
+                evalue = result.error.get("evalue", "")
+                text = f"Error: {ename}: {evalue}".rstrip(": ")
+            return text
 
     def record_accepted(self, code: str, event_number: int) -> None:
         """Record source that created event(s), up to the export size cap."""
@@ -924,31 +717,14 @@ class ACL2Session:
         self.accepted_code_size += len(code)
 
     async def terminate(self) -> None:
-        """Terminate the ACL2 session."""
+        """Shut down the session's kernel process."""
         self.alive = False
-        if self.stderr_task is not None and not self.stderr_task.done():
-            self.stderr_task.cancel()
         try:
-            if self.process.stdin:
-                try:
-                    self.process.stdin.write(b"(good-bye)\n")
-                    await self.process.stdin.drain()
-                    self.process.stdin.close()
-                except (BrokenPipeError, ConnectionResetError):
-                    # Process already dead, ignore
-                    pass
-            await asyncio.wait_for(self.process.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            self.process.kill()
-            await self.process.wait()
+            await asyncio.to_thread(self.kernel.shutdown)
         except Exception:
-            self.process.kill()
-            await self.process.wait()
-        if self.stderr_task is not None:
-            try:
-                await self.stderr_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            logger.debug(
+                f"Session {self.session_id}: kernel shutdown failed", exc_info=True
+            )
 
 
 def resolve_parinfer(arguments: Any, session: Optional[ACL2Session]) -> tuple[bool, str]:
@@ -1004,42 +780,27 @@ class SessionManager:
         session_id = str(uuid.uuid4())
 
         try:
-            # Pass through environment variables, especially ACL2_SYSTEM_BOOKS
-            env = os.environ.copy()
-            
-            # TODO: Don't hardcode path - should come from env var configured in devcontainer
-            # Check if ACL2_SYSTEM_BOOKS is set, if not try to detect or fail gracefully
-            if 'ACL2_SYSTEM_BOOKS' not in env:
-                logger.warning("ACL2_SYSTEM_BOOKS not set in environment for session, using fallback")
-                env['ACL2_SYSTEM_BOOKS'] = '/home/acl2/books'
-            
-            acl2_executable = env.get('ACL2', 'acl2')
-            logger.debug(f"Starting ACL2 session with ACL2={acl2_executable}, ACL2_SYSTEM_BOOKS={env.get('ACL2_SYSTEM_BOOKS')}")
-            
-            process = await asyncio.create_subprocess_exec(
-                acl2_executable,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
+            logger.debug(
+                f"Starting ACL2 kernel session with kernel={resolve_kernel_name()}, "
+                f"ACL2={os.environ.get('ACL2')}, "
+                f"LISP={os.environ.get('LISP')}, "
+                f"ACL2_SYSTEM_BOOKS={os.environ.get('ACL2_SYSTEM_BOOKS')}"
             )
+
+            kernel = await asyncio.to_thread(KernelClient)
 
             session = ACL2Session(
                 session_id=session_id,
                 name=name,
-                process=process,
+                kernel=kernel,
                 created_at=time.time(),
                 last_activity=time.time(),
                 parinfer_enabled=parinfer_enabled,
                 parinfer_mode=parinfer_mode,
             )
 
-            # Drain stderr for the life of the session so a full pipe cannot
-            # block ACL2.
-            session.stderr_task = asyncio.create_task(session.drain_stderr())
-
             self.sessions[session_id] = session
-            logger.info(f"Session {session_id} created (banner will be consumed on first command)")
+            logger.info(f"Session {session_id} created (kernel {kernel.kernel_name})")
 
             # Start cleanup task if not already running
             if self._cleanup_task is None:
@@ -1047,12 +808,9 @@ class SessionManager:
 
             return session_id, f"Session started successfully. ID: {session_id}"
 
-        except OSError as e:
+        except (KernelConfigError, KernelStartError) as e:
             logger.error(f"Failed to start session: {e}")
-            return "", (
-                f"Error: Could not start ACL2 executable '{acl2_executable}': {e}. "
-                "Set the ACL2 environment variable to the ACL2 binary."
-            )
+            return "", f"Error: {e}"
         except Exception as e:
             # SECURITY: Don't leak internal error details
             logger.error(f"Failed to start session: {e}")
@@ -1276,7 +1034,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="check_syntax",
-            description="Check ACL2 code for reader/syntax errors. Input is either inline code or an input_path file. By default the code is first balanced with parinfer (indent mode), so mismatched parens may be silently repaired; pass parinfer=false to validate the literal source. The balanced code is then fed to ACL2 for a short bounded run: only reader errors count as syntax errors, while admission failures and aborts are reported separately. On success, return the balanced source, write it to a different file (output_path/file_path), or rewrite the input file in place (in_place). Use 'admit' or 'prove' to establish that events are accepted.",
+            description="Check ACL2 code for reader/syntax errors. Input is either inline code or an input_path file. By default the code is first balanced with parinfer (indent mode), so mismatched parens may be silently repaired; pass parinfer=false to validate the literal source. The kernel then reports reader completeness directly: incomplete or invalid text is a syntax error and is not executed, while readable code is run for a bounded time and admission failures are reported separately. On success, return the balanced source, write it to a different file (output_path/file_path), or rewrite the input file in place (in_place). Use 'admit' or 'prove' to establish that events are accepted.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -1396,7 +1154,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="admit",
-            description="Test if an ACL2 event would be accepted without keeping it. In a persistent session the event is checked in the session's context and then rolled back with :ubt, so it does not change the world and is not exported. Without a session, a fresh ACL2 process is used and discarded. Input is either an inline event or an input_path file. Returns success/failure. Use 'prove' or 'evaluate' when you want the event to persist.",
+            description="Test if an ACL2 event would be accepted without keeping it. In a persistent session the event is checked in the session's context and then rolled back with :ubt, so it does not change the world and is not exported. Without a session, a fresh ACL2 kernel is used and discarded. Input is either an inline event or an input_path file. Returns success/failure. Use 'prove' or 'evaluate' when you want the event to persist.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -1527,7 +1285,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_world_state",
-            description="Display the current ACL2 world state in a session, showing all definitions, theorems, and events. Use this to see what's currently defined in your session. Uses ACL2's :pbt (print-back-through) command.",
+            description="Display the current ACL2 world state in a session, showing all definitions, theorems, and events. Use this to see what's currently defined in your session. Reads ACL2's command history for the requested window.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -1648,84 +1406,28 @@ async def list_tools() -> list[Tool]:
 
 
 async def run_acl2(code: str, timeout: int = 30, cwd: str | None = None) -> str:
-    """
-    Run ACL2 code and return the output.
+    """Run ACL2 code in a fresh Jupyter kernel and return its output.
 
-    Args:
-        code: ACL2 code to execute
-        timeout: Timeout in seconds
-        cwd: Working directory for ACL2 process (optional)
-
-    Returns:
-        Output from ACL2
+    Each call starts a kernel, runs one cell, and shuts the kernel down, which
+    preserves the old "fresh ACL2 world" semantics for the file-based tools.
+    Persistent sessions use a long-lived KernelClient instead.
     """
-    # Validate inputs
     if len(code) > MAX_CODE_LENGTH:
         return f"Error: Code exceeds maximum length of {MAX_CODE_LENGTH} characters"
 
     timeout = validate_timeout(timeout)
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".lisp", delete=False
-    ) as f:
-        f.write(code)
-        f.write("\n(good-bye)\n")  # Exit ACL2
-        temp_file = f.name
-
     try:
-        # Pass through environment variables, especially ACL2_SYSTEM_BOOKS
-        env = os.environ.copy()
-        
-        # TODO: Don't hardcode path - should come from env var configured in devcontainer
-        # Check if ACL2_SYSTEM_BOOKS is set, if not try to detect or fail gracefully
-        if 'ACL2_SYSTEM_BOOKS' not in env:
-            logger.warning("ACL2_SYSTEM_BOOKS not set in environment, using fallback")
-            env['ACL2_SYSTEM_BOOKS'] = '/home/acl2/books'
-        
-        # Log environment for debugging
-        acl2_vars = {k: v for k, v in env.items() if 'ACL2' in k}
-        logger.debug(f"ACL2 environment variables: {acl2_vars}")
-        acl2_executable = env.get('ACL2', 'acl2')
-        logger.debug(f"Running ACL2 ({acl2_executable}) with cwd={cwd}")
-        
-        try:
-            process = await asyncio.create_subprocess_exec(
-                acl2_executable,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
-                env=env,
-            )
-        except OSError as e:
-            return (
-                f"Error: Could not start ACL2 executable '{acl2_executable}': {e}. "
-                "Set the ACL2 environment variable to the ACL2 binary."
-            )
+        result = await asyncio.to_thread(execute_once, code, timeout, cwd)
+    except KernelTimeout as exc:
+        return f"Error: {exc}"
+    except (KernelConfigError, KernelStartError, KernelDied) as exc:
+        return f"Error: {exc}"
+    except Exception:
+        logger.exception("Unexpected failure running ACL2 kernel")
+        return "Error: Failed to execute ACL2 code"
 
-        # Read the temp file and send to ACL2
-        with open(temp_file, "r") as f:
-            input_data = f.read()
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=input_data.encode()),
-                timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            return f"Error: ACL2 execution timed out after {timeout} seconds"
-
-        output = stdout.decode()
-        if stderr:
-            error_output = stderr.decode()
-            if error_output.strip():
-                output += f"\n\nStderr:\n{error_output}"
-
-        return clean_acl2_output(output)
-    finally:
-        Path(temp_file).unlink(missing_ok=True)
+    return clean_acl2_output(result.text)
 
 
 async def run_acl2_file(file_path: str, timeout: int = 60) -> str:
@@ -2198,16 +1900,29 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        # Use ACL2's :pbt to show recent events.  :pbt prints from start_event
-        # through the current command, so include the current event itself in
-        # the requested window (and clamp to event 0).
-        start_event = max(0, session.event_counter - limit + 1)
-        output = await session.send_command(f":pbt {start_event}")
+        # Show the recent command forms.  get-command-sequence returns the
+        # source of commands start..end (relative command numbers), which is
+        # more reliable than :pbt through the kernel's trans-eval path.
+        end_event = session.event_counter
+        if end_event <= 0:
+            return [
+                TextContent(
+                    type="text",
+                    text="World state: no commands yet (boot-strap world only).",
+                )
+            ]
+        start_event = max(1, end_event - limit + 1)
+        output = await session.send_command(
+            f"(acl2::get-command-sequence {start_event} {end_event})"
+        )
 
         return [
             TextContent(
                 type="text",
-                text=f"World state (last {limit} events):\n\n{output}",
+                text=(
+                    f"World state (last {end_event - start_event + 1} event(s), "
+                    f"commands {start_event}-{end_event}):\n\n{output}"
+                ),
             )
         ]
 
@@ -2412,43 +2127,13 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        output = await run_acl2(balanced, timeout=timeout)
-
-        # ACL2 has no read-only syntax checker, so this runs the code for a
-        # bounded time.  Only reader/parser errors are syntax errors; admission
-        # failures, aborts, and timeouts are reported as separate outcomes so
-        # "No syntax errors detected" is not mistaken for a green light.
-        syntax_error_patterns = [
-            "end of file on",
-            "unmatched close parenthesis",
-            "read error",
-            "reader-error",
-            "illegal terminating character",
-            "does not exist",  # Package X does not exist
-            "no dispatch function defined for",
-        ]
-
-        output_lower = output.lower()
-        is_syntax_error = any(pattern in output_lower for pattern in syntax_error_patterns)
-        source_note = f" in {input_abs}" if input_abs is not None else ""
-
-        if is_syntax_error:
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Syntax errors found{source_note}:\n\n{output}",
-                )
-            ]
-
-        if output.startswith("Error: Could not start ACL2"):
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Syntax check could not run: {output}",
-                )
-            ]
-
-        if output.startswith("Error: ACL2 execution timed out"):
+        # The kernel answers reader completeness directly, so unbalanced input
+        # is rejected without executing anything (and without hanging).
+        try:
+            syntax_status, cell = await asyncio.to_thread(
+                check_syntax_once, balanced, timeout
+            )
+        except KernelTimeout:
             return [
                 TextContent(
                     type="text",
@@ -2459,6 +2144,45 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                     ),
                 )
             ]
+        except (KernelConfigError, KernelStartError, KernelDied) as e:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Syntax check could not run: {e}",
+                )
+            ]
+        except Exception:
+            logger.exception("Unexpected failure during syntax check")
+            return [
+                TextContent(
+                    type="text",
+                    text="Syntax check could not run: unexpected kernel failure",
+                )
+            ]
+
+        source_note = f" in {input_abs}" if input_abs is not None else ""
+        if syntax_status == "incomplete":
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Syntax errors found{source_note}: the form is incomplete "
+                        "(unbalanced parentheses or unexpected end of file)."
+                    ),
+                )
+            ]
+        if syntax_status == "invalid":
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Syntax errors found{source_note}: the text is not readable "
+                        "as ACL2 (unmatched close parenthesis or invalid token)."
+                    ),
+                )
+            ]
+
+        output = clean_acl2_output(cell.text) if cell is not None else ""
 
         notes = parinfer_unavailable_note(bool(use_parinfer))
         if balanced != code:
@@ -2611,7 +2335,9 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                     type="text",
                     text=(
                         f"Error: No event named '{validated_theorem}' was introduced "
-                        f"by {abs_path}."
+                        f"by {abs_path}. The name may be misspelled, or an earlier "
+                        "form in the file may have failed to admit. Load output:\n\n"
+                        f"{output.replace(no_event_marker, '').strip()}"
                     ),
                 )
             ]

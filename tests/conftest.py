@@ -1,8 +1,9 @@
 """Shared pytest configuration.
 
-Tests that start a real ACL2 are marked ``acl2`` and are skipped when no ACL2
-executable is configured, instead of failing with FileNotFoundError.  Configure
-one with the ``ACL2`` environment variable or by putting ``acl2`` on PATH.
+Tests that start a real ACL2 are marked ``acl2`` and are skipped unless both
+an ACL2 launcher (``ACL2`` or ``acl2`` on PATH) and the matching ACL2 Jupyter
+kernelspec are available.  Install a kernelspec with
+``acl2-jupyter-kernel/install-kernelspec.sh``.
 """
 
 import os
@@ -20,14 +21,30 @@ def _acl2_available() -> bool:
     return shutil.which(executable) is not None
 
 
-ACL2_AVAILABLE = _acl2_available()
+def _kernel_available() -> bool:
+    try:
+        from acl2_mcp.kernel_backend import KernelConfigError, resolve_kernel_name
+    except Exception:
+        return False
+    try:
+        from jupyter_client.kernelspec import KernelSpecManager
+    except Exception:
+        return False
+    try:
+        KernelSpecManager().get_kernel_spec(resolve_kernel_name())
+        return True
+    except Exception:
+        return False
+
+
+ACL2_AVAILABLE = _acl2_available() and _kernel_available()
 
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
-        "acl2: test requires a working ACL2 executable "
-        "(ACL2 environment variable or acl2 on PATH)",
+        "acl2: test requires a working ACL2 launcher and an installed "
+        "ACL2 Jupyter kernelspec",
     )
 
 
@@ -35,6 +52,6 @@ def pytest_configure(config: pytest.Config) -> None:
 def require_acl2(request: pytest.FixtureRequest) -> None:
     if request.node.get_closest_marker("acl2") and not ACL2_AVAILABLE:
         pytest.skip(
-            "ACL2 is not configured; set ACL2 to a working ACL2 binary "
-            "or put acl2 on PATH"
+            "ACL2 is not configured for the kernel backend; set ACL2 to a "
+            "working saved_acl2 and install the matching kernelspec"
         )

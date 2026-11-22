@@ -5,20 +5,22 @@
 
 A Model Context Protocol (MCP) server that provides tools for interacting with the ACL2 theorem prover.
 
+Execution is delegated to the [ACL2 Jupyter kernel](https://github.com/jimwhite/acl2-jupyter-kernel), which runs *inside* the ACL2 process (on SBCL or CCL) and speaks the Jupyter wire protocol. The server is a Jupyter client: values, proof output, reader errors, and per-cell event metadata arrive as protocol messages rather than scraped prompts. Each persistent session owns one kernel process; one-off tools start a fresh kernel, run one cell, and shut it down.
+
 ## Features
 
 This MCP server exposes 19 tools for working with ACL2, including support for persistent sessions that enable incremental development:
 
 ### Session Management Tools
-- **start_session**: Create a persistent ACL2 session for incremental development. Accepts `parinfer` (default true) and `parinfer_mode` (default `indent`).
+- **start_session**: Create a persistent ACL2 session (one Jupyter kernel process) for incremental development. Accepts `parinfer` (default true) and `parinfer_mode` (default `indent`).
 - **end_session**: End a persistent session and clean up resources
 - **list_sessions**: List all active sessions with their status
 
 ### Code-based Tools
 - **prove**: Submit ACL2 theorems (defthm) for proof
 - **evaluate**: Evaluate arbitrary ACL2 expressions and definitions
-- **check_syntax**: Check ACL2 code for reader/parser errors. The code is balanced with parinfer first (indent mode) unless `parinfer: false`; on success, `return_source: true` returns the balanced source, `output_path` (or its alias `file_path`) writes a different file, and `in_place: true` rewrites the input file. Only reader errors count as syntax errors, and a timeout or reader error never writes. Admission failures and aborts are reported separately (see **Important behaviors** below).
-- **admit**: Test if an ACL2 event would be admitted, without keeping it. In a session the event is checked in context and then rolled back with `:ubt`; without a session a fresh process is used.
+- **check_syntax**: Check ACL2 code for reader/parser errors. The code is balanced with parinfer first (indent mode) unless `parinfer: false`; on success, `return_source: true` returns the balanced source, `output_path` (or its alias `file_path`) writes a different file, and `in_place: true` rewrites the input file. The kernel's reader-completeness request classifies the text before anything runs, so unbalanced input is rejected without executing or writing. Readable code is then run for a bounded time; admission failures and aborts are reported separately (see **Important behaviors** below).
+- **admit**: Test if an ACL2 event would be admitted, without keeping it. In a session the event is checked in context and then rolled back with `:ubt`; without a session a fresh kernel is used and discarded.
 - **retry_proof**: Submit another proof attempt in a session, typically with changed hints. It balances with parinfer by default, does not undo the previous attempt, and records successful events for export.
 - **parinfer**: Balance Lisp/ACL2 code in-process with parinfer (`indent`, `paren`, or `smart` mode; indent is the default). Returns the balanced source, or writes it to `output_path`/`file_path` or back to the input with `in_place`. `paren` mode reports mismatched parens instead of repairing them.
 
@@ -42,12 +44,13 @@ All code-based tools accept either inline `code` or an `input_path` file (exactl
 
 ## Important behaviors
 
-- **Output is cleaned.** The ACL2 startup banner and interactive `ACL2 !>` prompts are removed from results. Set `ACL2_MCP_RAW_OUTPUT=1` to keep the raw transcript for debugging.
-- **Sessions start from a bare ACL2 world.** No project books or customization files are loaded; use `include_book` or a session `evaluate` call for that.
-- **A session command timeout terminates the session.** This avoids leaving ACL2's reader mid-form, where every later command would hang. Start a new session to continue.
-- **`check_syntax` is not a proof.** It runs ACL2 for a bounded time (default 5s, configurable with `timeout`) and classifies only reader errors as syntax errors. A result saying "No syntax errors detected, but ACL2 reported errors..." means the code was readable but admission/proof failed.
-- **Default parinfer mode may repair parens.** With indent mode, an extra `)` can be dropped or a missing `)` added before checking. Pass `parinfer: false` to validate the literal source; use `paren` mode with the `parinfer` tool to detect mismatches.
-- **`admit` is a test.** In a session it rolls the test event back, so it does not appear in the world or in `export_session_code`.
+- **Output comes from the kernel.** There are no interactive prompts to scrape. ACL2's startup banner is written to a per-kernel log file (`/tmp/acl2-mcp-kernel-<name>.log` by default) so it cannot corrupt the MCP stdio transport. `ld`-style announcements and `Bye.`/`:EOF` trailers are removed from results. Set `ACL2_MCP_RAW_OUTPUT=1` to keep the raw cell transcript, and `ACL2_MCP_KERNEL_LOG_DIR` to redirect the child-process log.
+- **Sessions start from a bare ACL2 world.** No project books or customization files are loaded; use `include_book` or a session `evaluate` call for that. `ACL2_SYSTEM_BOOKS` and `ACL2_CUSTOMIZATION` are passed to the kernel process.
+- **A session command timeout terminates the session.** The kernel is stopped rather than left mid-form. Start a new session to continue.
+- **`check_syntax` asks the reader first.** The kernel reports `complete`, `incomplete`, or `invalid` without executing unfinished input; only readable code is run for the bounded timeout (default 5s). A result saying "No syntax errors detected, but ACL2 reported errors..." means the code was readable but admission/proof failed.
+- **Default parinfer mode may repair parens.** With indent mode, an extra `)` can be dropped or a missing `)` added before checking. Pass `parinfer: false` to validate the literal source; use `paren` mode with the `parinfer` tool to detect mismatches. An unbalanced cell submitted with `parinfer: false` now returns a reader error immediately instead of hanging.
+- **`admit` is a test.** In a session it rolls world events back, so they do not appear in the world or in `export_session_code`. Command state that is not part of the world (for example `set-guard-checking`) is not undone.
+- **Book certificates are implementation-specific.** Certify and include books with the same Lisp that built the ACL2 image. Using an SBCL ACL2 against a books tree certified by CCL fails with a logical-world mismatch, so keep one implementation per repository/books tree and install the matching kernelspec.
 
 ### Tool argument conventions
 
@@ -62,9 +65,50 @@ All code-based tools accept either inline `code` or an `input_path` file (exactl
 
 ## Prerequisites
 
-- Python 3.10 or later
-- ACL2. Set `ACL2` to the ACL2 executable (for example `/path/to/acl2/saved_acl2`), or put `acl2` on `PATH`. Set `ACL2_SYSTEM_BOOKS` to the ACL2 `books` directory so `include_book` can find system books.
+- Python 3.10 or later. `jupyter_client` and `pyzmq` are installed as package dependencies.
+- ACL2 built on **SBCL or CCL**, with Quicklisp available. The kernel quickloads itself from `quicklisp/setup.lisp` at startup.
+- An installed ACL2 Jupyter kernelspec for that ACL2 image (see below).
+- `libzmq` for the kernel's ZeroMQ transport.
 - The parinfer-rust shared library is required for the default balancing behavior. The default path is `/usr/local/lib/libparinfer_rust.so`; set `PARINFER_LIB` to override it. Without it, `prove`/`evaluate`/`admit`/`retry_proof`/`check_syntax` submit code unchanged and say so, while the `parinfer` tool returns an error.
+
+### Kernel selection
+
+The server picks a kernelspec from the environment (an explicit override wins, then the `ACL2` launcher script, then `LISP`):
+
+| Variable | Effect |
+| --- | --- |
+| `ACL2` | Path to `saved_acl2`. Its `exec` line selects CCL (`-I`) or SBCL (`--core`), and must exist and be executable. |
+| `LISP` (or `ACL2_LISP`) | Used when the script is ambiguous: `ccl` → kernel `acl2`, `sbcl` → kernel `acl2-sbcl`. |
+| `ACL2_MCP_KERNEL` (or `ACL2_MCP_KERNEL_NAME`) | Explicit kernelspec name; overrides detection. |
+| `ACL2_SYSTEM_BOOKS` | Passed to the kernel; controls `:dir :system` resolution. |
+| `ACL2_CUSTOMIZATION` | Passed to the kernel; defaults to `NONE`. |
+| `ACL2_MCP_KERNEL_LOG_DIR` | Directory for kernel child-process logs (default `/tmp`). |
+| `ACL2_MCP_RAW_OUTPUT` | Keep raw cell transcripts in tool results. |
+
+### Install a kernelspec
+
+From the `acl2-jupyter-kernel` checkout:
+
+```bash
+# For the ACL2 image you use (CCL example: /workspaces/acl2/saved_acl2)
+ACL2=/workspaces/acl2/saved_acl2 \
+ACL2_HOME=/workspaces/acl2 \
+QUICKLISP_SETUP="$HOME/quicklisp/setup.lisp" \
+  ./install-kernelspec.sh
+```
+
+This installs the kernel under the name **`acl2`**. To keep a second implementation available as well, give it a distinct name:
+
+```bash
+# SBCL image elsewhere; installs kernelspec "acl2-sbcl"
+ACL2=/path/to/sbcl-saved_acl2 ACL2_HOME=/path/to/acl2 \
+ACL2_JUPYTER_KERNEL_NAME=acl2-sbcl \
+ACL2_JUPYTER_DISPLAY_NAME="ACL2 (SBCL)" \
+QUICKLISP_SETUP="$HOME/quicklisp/setup.lisp" \
+  ./install-kernelspec.sh
+```
+
+Remember that a books tree is certified for one Lisp implementation. Do not point an SBCL kernel at a CCL-certified books tree (or vice versa).
 
 ## Installation
 
@@ -82,17 +126,15 @@ pip install -e '.[dev]'
 
 ### Running the tests
 
-The ACL2-dependent tests are marked `acl2` and skip when no executable is
-configured. To run the complete suite:
+The ACL2-dependent tests are marked `acl2` and skip unless both a working `ACL2` launcher and the matching kernelspec are available. To run the complete suite:
 
 ```bash
-export ACL2=/path/to/acl2/saved_acl2
-export ACL2_SYSTEM_BOOKS=/path/to/acl2/books
+export ACL2=/workspaces/acl2/saved_acl2
+export ACL2_SYSTEM_BOOKS=/workspaces/acl2/books
 pytest
 ```
 
-Without those variables, tests that need a real ACL2 are skipped instead of
-failing; pure validation/parinfer tests still run.
+Without those prerequisites, tests that need a real ACL2 kernel are skipped instead of failing; pure validation/parinfer tests still run.
 
 ## Usage
 
@@ -173,7 +215,9 @@ ZCode reads MCP servers from the workspace config (`<repo>/.zcode/config.json`) 
         "args": [],
         "env": {
           "ACL2_SYSTEM_BOOKS": "/path/to/acl2/books",
-          "ACL2": "/path/to/acl2/saved_acl2"
+          "ACL2": "/path/to/acl2/saved_acl2",
+          "ACL2_CUSTOMIZATION": "NONE",
+          "LISP": "ccl"
         }
       }
     }
@@ -491,37 +535,43 @@ export ACL2_SYSTEM_BOOKS=/path/to/acl2/books
 pytest
 ```
 
-Tests marked `acl2` skip when no ACL2 executable is configured, so the suite
-does not fail with `FileNotFoundError` on a machine without ACL2.
+Tests marked `acl2` skip when no ACL2 launcher or matching kernelspec is
+configured, so the suite does not fail on a machine without ACL2 or the
+Jupyter kernel.
 
 ## How It Works
 
-The server supports two execution modes:
+All execution goes through a Jupyter kernel (`acl2` or `acl2-sbcl`) started with `jupyter_client`:
 
 ### One-off Execution (Default)
 When no `session_id` is provided, each tool call:
-1. Writes ACL2 code to a temporary `.lisp` file
-2. Starts a fresh ACL2 process with the code as input
-3. Captures stdout/stderr and strips the startup banner/prompts
-4. Cleans up the temporary file and terminates ACL2
-
-If the ACL2 executable cannot be started, the tool returns an `Error: Could not
-start ACL2 executable ...` message rather than raising a Python exception.
+1. Starts a fresh ACL2 kernel process (child stdout/stderr go to a log file, not the MCP transport)
+2. Sends the code as one `execute_request`
+3. Collects `stream`, `execute_result`, `error`, and `display_data` messages
+4. Reads the vendor event metadata (`application/vnd.acl2.events+json`) for event counts/forms
+5. Shuts the kernel down (on timeout it is killed and the error says so)
 
 ### Persistent Sessions (Incremental Development)
 When using sessions:
-1. `start_session` creates a long-running ACL2 process with persistent stdin/stdout pipes
-2. A background task drains stderr so a full pipe cannot block ACL2
-3. Each tool call sends commands to the existing process and reads until a random marker
-4. The probe's own return value and prompt are consumed so they do not leak into the next result
-5. The ACL2 world state accumulates across multiple commands
-6. `undo`/checkpoint restore and raw `:ubt` commands prune checkpoints and exported forms
-7. A command timeout terminates the process instead of leaving the reader desynchronized
-8. Sessions auto-cleanup after 30 minutes of inactivity or when explicitly ended
-9. Up to 50 concurrent sessions are supported
+1. `start_session` starts one long-lived ACL2 kernel
+2. Each tool call sends one cell; output and values arrive as Jupyter messages (no prompt scraping)
+3. After every command the server asks ACL2 for its current relative command number, so `undo`/checkpoints stay exact even for multi-event commands and failed proofs
+4. `undo`/checkpoint restore send `:ubt` and prune checkpoints and exported forms above the new position
+5. `get_world_state` reads ACL2's command history directly
+6. A command timeout shuts the kernel down instead of leaving a desynchronized reader
+7. Sessions auto-cleanup after 30 minutes of inactivity or when explicitly ended
+8. Up to 50 concurrent sessions are supported
 
 Per-tool timeout defaults are 30–120 seconds (see each tool); values are clamped
-to 1–300 seconds. `check_syntax` defaults to a 5-second bounded run.
+to 1–300 seconds. `check_syntax` defaults to a 5-second bounded run after the
+kernel's reader check.
+
+### Kernel backend code
+
+`acl2_mcp/kernel_backend.py` contains the transport: kernelspec resolution,
+environment handling, `KernelClient` (execute, completeness check, command
+number), and one-shot helpers. `server.py` keeps the tool API and uses those
+primitives.
 
 ## License
 

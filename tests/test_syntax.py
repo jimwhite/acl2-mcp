@@ -88,3 +88,29 @@ async def test_check_syntax_parinfer_false_keeps_syntax_errors() -> None:
     )
 
     assert text(result).startswith("Syntax errors found")
+
+
+@pytest.mark.asyncio
+async def test_check_syntax_incomplete_input_is_reported() -> None:
+    """An unclosed form is rejected by the kernel reader, not by a timeout."""
+    result = await call_tool(
+        "check_syntax",
+        {"code": "(defun missing-paren (x) (* 2 x)", "parinfer": False},
+    )
+
+    output = text(result)
+    assert output.startswith("Syntax errors found")
+    assert "incomplete" in output
+
+
+@pytest.mark.asyncio
+async def test_check_syntax_admission_error_is_not_a_syntax_error() -> None:
+    """A missing book is readable code; it must not be called a syntax error."""
+    result = await call_tool(
+        "check_syntax",
+        {"code": '(include-book "no/such/book" :dir :system)'},
+    )
+
+    output = text(result)
+    assert "No syntax errors detected" in output
+    assert "does not exist" in output
