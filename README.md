@@ -32,8 +32,8 @@ All code-based tools accept either inline `code` or an `input_path` file (exactl
 - **check_theorem**: Check a specific theorem in an ACL2 file by name (file path includes `.lisp`)
 
 ### Query and Verification Tools
-- **query_event**: Query information about a defined function, theorem, or event (uses :pe)
-- **verify_guards**: Verify guards for a function to ensure efficient execution
+- **query_event**: Query information about a defined function, theorem, or event (uses :pe). Pass `session_id` to query a persistent session's world.
+- **verify_guards**: Verify guards for a function to ensure efficient execution. Pass `session_id` to verify a function in a persistent session.
 
 ### Session State Management Tools
 - **undo**: Undo the last N events in a session
@@ -343,7 +343,8 @@ Tool: start_session
 Arguments:
   name: "natural-numbers-proof"  (optional, for easy identification)
 
-Returns: "Session started successfully. ID: <uuid>" (parse out the UUID)
+Returns: "Session started successfully. Use the ID below as the session_id argument in later calls.
+ID: <uuid>" (use the UUID after "ID: ")
 ```
 
 **2. Define functions incrementally:**
@@ -519,9 +520,11 @@ Tool: query_event
 Arguments:
   name: "append"
   file_path: "path/to/file.lisp"  (optional, if function is in a file)
+  session_id: "a1b2c3d4-..."  (optional; query this session's world instead)
   timeout: 30  (optional)
 
-Returns the definition and properties of the named event.
+Returns the definition and properties of the named event. Use either
+`file_path` or `session_id`, not both.
 ```
 
 **Verify Guards:**
@@ -530,9 +533,11 @@ Tool: verify_guards
 Arguments:
   function_name: "my-function"
   file_path: "path/to/file.lisp"  (optional, if function is in a file)
+  session_id: "a1b2c3d4-..."  (optional; verify in this session's world)
   timeout: 60  (optional)
 
-Verifies that the function's guards are satisfied.
+Verifies that the function's guards are satisfied. Use either `file_path` or
+`session_id`, not both.
 ```
 
 ## Development

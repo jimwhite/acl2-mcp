@@ -90,10 +90,12 @@ The ACL2 MCP server executes arbitrary ACL2 code provided by the client. This is
 
 ### 4. Process Isolation
 
-- ACL2 runs as separate subprocess
-- Timeout enforcement with process termination
-- Temporary files cleaned up after execution
-- stdin/stdout/stderr properly captured
+- ACL2 runs as a separate Jupyter kernel subprocess for each one-off call or
+  persistent session
+- Timeout enforcement shuts down the kernel process
+- No temporary `.lisp` files are created for execution
+- The MCP transport's stdin/stdout are never shared with the kernel; the
+  kernel's own stdout/stderr go to a log file
 
 ### 5. Session Security
 
@@ -103,9 +105,10 @@ The ACL2 MCP server executes arbitrary ACL2 code provided by the client. This is
 - Sessions auto-terminate after 30 minutes of inactivity
 
 **Timeout Protection**:
-- True total timeout (not per-line) prevents slow-read attacks
-- Cryptographically random markers prevent injection
-- A timed-out session command kills that ACL2 process, preventing a blocked
+- True total timeout (not a per-line read) prevents slow-read attacks
+- Commands travel as Jupyter `execute_request` messages; there is no marker or
+  prompt string that untrusted code could forge
+- A timed-out session command kills that ACL2 kernel, preventing a blocked
   reader from desynchronizing later commands (state is not preserved)
 - Timeout applies to both one-off and session commands
 
@@ -114,15 +117,20 @@ The ACL2 MCP server executes arbitrary ACL2 code provided by the client. This is
 - Race-condition-safe cleanup with session snapshots
 - Safe shutdown handles all active sessions
 
-**Stderr Handling**:
-- Each session has a background task draining stderr into a bounded deque
-- A chatty ACL2 process therefore cannot block on a full stderr pipe
+**Kernel stderr handling**:
+- The kernel child's stdout/stderr are redirected to a log file
+  (`ACL2_MCP_KERNEL_LOG_DIR`, default `/tmp/acl2-mcp-kernel-<kernel>.log`)
+- A chatty ACL2 process therefore cannot block on a pipe or corrupt the MCP
+  stdio transport
 
 ### 6. Error Handling
 
 - Missing ACL2 executables return a clear tool error with the executable path
 - Missing required arguments are reported as tool errors, not KeyErrors
 - Unknown tools and validation failures return `isError` tool results
+- ACL2 failures (failed proofs, rejected events, failed book certification) are
+  also reported as `isError`, even though ACL2 writes `ACL2 Error` or
+  `******** FAILED ********` rather than `Error:`
 - Unexpected internal exceptions are logged server-side and returned generically
 - ACL2's own transcript is returned to the caller by design (it is the result)
 - File-path errors may include the requested path so the user can correct it
@@ -170,11 +178,13 @@ See `tests/test_security.py` for complete test coverage.
 - No directory confinement: the server can write anywhere the process can
 - **Mitigation**: Only use with trusted clients and users
 
-**Session stderr content**:
-- stderr is drained and only a bounded tail is retained for debugging; it is
-  not included in ordinary tool results
-- Error information printed only to stderr may therefore be lost
-- **Mitigation**: Use one-off execution when complete stderr is needed
+**Kernel stderr content**:
+- Kernel stderr is written to a per-kernel log file, not included in ordinary
+  tool results
+- Error information printed only to kernel stderr may therefore be lost from
+  the result
+- **Mitigation**: Inspect the kernel log under `ACL2_MCP_KERNEL_LOG_DIR` when a
+  result is unexpectedly incomplete
 
 ## Best Practices for Deployment
 

@@ -206,6 +206,7 @@ async def test_check_theorem_reproves_without_using_itself(tmp_path: Path) -> No
     )
     text = result[0].text
     assert "Q.E.D." in text, text
+    assert "re-proved successfully" in text, text
     assert "neither a function nor macro definition" not in text, text
 
 
@@ -220,6 +221,7 @@ async def test_check_theorem_reports_missing_event(tmp_path: Path) -> None:
     )
     text = result[0].text
     assert "No event named 'absent-name'" in text, text
+    assert "ACL2 Error in :UBT" not in text, text
 
 
 async def test_include_book_resolves_system_books() -> None:
@@ -254,6 +256,7 @@ async def test_dead_session_is_reaped() -> None:
     sessions = await call_tool("list_sessions", {})
     listed = sessions[0].text
     assert "[terminated]" in listed, listed
+    assert "end_session" in listed, listed
 
     # The reaper (or an explicit end) should clean it up.
     await call_tool("end_session", {"session_id": session_id})

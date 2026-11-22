@@ -57,3 +57,38 @@ async def test_unknown_tool_is_a_tool_error() -> None:
         assert result.is_error
         text = "".join(getattr(block, "text", "") for block in result.content)
         assert "Unknown tool" in text
+
+
+@pytest.mark.acl2
+@pytest.mark.asyncio
+async def test_acl2_proof_failure_is_a_tool_error() -> None:
+    """ACL2 proofs fail with "ACL2 Error"/"FAILED", not "Error:", but the
+    result must still be marked isError."""
+    async with Client(_server_params(), mode="auto") as client:
+        result = await client.call_tool(
+            "prove",
+            {"code": "(defthm false-thm (equal (len (append x y)) (len x)))"},
+        )
+
+        assert result.is_error
+        text = "".join(getattr(block, "text", "") for block in result.content)
+        assert "FAILED" in text or "ACL2 Error" in text
+
+
+@pytest.mark.acl2
+@pytest.mark.asyncio
+async def test_syntax_check_timeout_is_a_tool_error() -> None:
+    """A syntax check that times out is not a successful check."""
+    async with Client(_server_params(), mode="auto") as client:
+        code = (
+            "(defun exp-slow (n)"
+            " (if (zp n) 1 (+ (exp-slow (1- n)) (exp-slow (1- n)))))\n"
+            "(exp-slow 60)"
+        )
+        result = await client.call_tool(
+            "check_syntax", {"code": code, "timeout": 1, "parinfer": False}
+        )
+
+        assert result.is_error
+        text = "".join(getattr(block, "text", "") for block in result.content)
+        assert "timed out" in text

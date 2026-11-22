@@ -2,6 +2,28 @@
 
 This file provides guidance to AI coding agents (ZCode and other AGENTS.md-aware tools) when working with code in this repository.
 
+## Container user
+
+In this dev container, run every server, test, and ACL2 command as the
+`vscode` user, never as root. The ACL2 image, kernelspecs, Quicklisp, and
+virtualenv live under `/home/vscode`; root-owned files there break the kernel
+and the MCP server.
+
+From a root shell:
+
+```bash
+export ACL2=/workspaces/acl2/saved_acl2
+export ACL2_SYSTEM_BOOKS=/workspaces/acl2/books
+export ACL2_CUSTOMIZATION=NONE
+export LISP=ccl
+sudo -n -E -u vscode env HOME=/home/vscode \
+  /home/vscode/venv/bin/python -m pytest
+```
+
+Use the same `sudo -n -E -u vscode env HOME=/home/vscode ...` form for any other
+command. This is also how the workspace `.zcode/config.json` launches the MCP
+server.
+
 ## Project Overview
 
 This is an MCP (Model Context Protocol) server that provides tools for interacting with the ACL2 theorem prover. The server enables AI assistants to work with ACL2 through 19 different tools, supporting both one-off execution and persistent sessions for incremental development.
@@ -18,34 +40,35 @@ This is an MCP (Model Context Protocol) server that provides tools for interacti
 
 ### Execution Modes
 
-1. **One-off execution** (default): Each tool call creates a fresh ACL2 process
-   - Code written to temp `.lisp` file
-   - ACL2 process started with code as input
-   - Output captured and returned
-   - Resources cleaned up
+1. **One-off execution** (default): Each tool call starts a fresh Jupyter
+   kernel (`KernelClient`), runs one cell, and shuts the kernel down
+   (`execute_once`). The file-based tools wrap this with `ld`, `include-book`,
+   or `certify-book`. The ACL2 world starts bare each time.
 
-2. **Persistent sessions**: Long-running ACL2 processes for incremental work
+2. **Persistent sessions**: One long-lived Jupyter kernel per session
    - Managed by `SessionManager` (singleton: `session_manager`)
-   - Each session has stdin/stdout pipes for bidirectional communication
+   - Each session owns a `KernelClient` speaking the Jupyter wire protocol over
+     ZeroMQ; there is no stdin/stdout pipe or marker protocol
    - Sessions maintain ACL2 world state across commands
-   - Auto-cleanup after 30 minutes inactivity
+   - Auto-cleanup after 30 minutes inactivity; dead sessions are reaped within
+     about a minute
    - Max 50 concurrent sessions
 
 ### Session Communication
 
-Sessions use a marker-based protocol to detect command completion:
-- Commands sent via stdin
-- Cryptographically random marker sent after each command: `__M_{uuid}__`
-- The marker form also reports ACL2's relative command number, which drives
-  event counts and backtracking
-- Reads stdout until the marker appears or the total timeout expires
-- After the marker, the probe's own `NIL` return value and prompt are consumed
-  so they do not leak into the next result
-- A command timeout kills the ACL2 process (`terminate_after_timeout`).  This is
-  deliberate: leaving the reader inside an incomplete form would make every
-  subsequent command hang
-- A background task drains stderr into a bounded deque so a full pipe cannot
-  block ACL2
+- Commands are sent as Jupyter `execute_request` messages; output, values,
+  errors, and per-cell event metadata arrive as protocol messages.
+- Completion is the Jupyter `status: idle` message for that request, not a
+  marker or a scraped prompt.
+- `KernelClient.command_number()` runs `COMMAND_NUMBER_FORM` after a command to
+  refresh the session's relative event count, which drives `undo`,
+  checkpoints, and export pruning.
+- A command timeout shuts the kernel down (`_shutdown_unlocked`) and marks the
+  session dead. This is deliberate: leaving the kernel inside an incomplete
+  form would desynchronize every later command.
+- The kernel child's stdout/stderr are redirected to
+  `/tmp/acl2-mcp-kernel-<kernel>.log` (`ACL2_MCP_KERNEL_LOG_DIR`) so ACL2 output
+  cannot corrupt the MCP stdio transport.
 
 ### Output Cleaning
 
@@ -160,10 +183,17 @@ When adding/modifying tools:
   undo/restore/raw `:ubt`; bare evaluations are not recorded.
 - **retry_proof** balances with parinfer and records successful events, like
   `prove`.
+- **query_event** and **verify_guards** accept either a one-off world
+  (optionally seeded with `file_path`) or a session's current world
+  (`session_id`); the two sources are mutually exclusive. A successful session
+  `verify_guards` records the event for export.
+- **check_theorem** strips the `ld` prefix and the expected `:ubt` error for a
+  missing name, and starts its result with an explicit re-proof summary.
 - **check_syntax** classifies reader errors separately from admission failures,
   aborts, and timeouts, and does not write output on reader errors or timeouts.
-- **Session timeout** terminates the process (`terminate_after_timeout`); do not
-  change this back to returning a timeout while leaving the reader blocked.
+- **Session timeout** shuts down the kernel
+  (`KernelClient._shutdown_unlocked`) and marks the session dead; do not change
+  this back to returning a timeout while leaving the kernel running.
 
 ## Key Constraints
 

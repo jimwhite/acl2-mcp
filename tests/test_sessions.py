@@ -26,6 +26,7 @@ async def test_start_session() -> None:
     assert len(result) == 1
     assert result[0].type == "text"
     assert "Session started successfully" in result[0].text
+    assert "session_id argument" in result[0].text
     assert "ID:" in result[0].text
 
     # Extract session ID for cleanup
@@ -123,6 +124,88 @@ async def test_evaluate_in_session() -> None:
 
     # Cleanup
     await call_tool("end_session", {"session_id": session_id})
+
+
+@pytest.mark.asyncio
+async def test_query_event_in_session() -> None:
+    """query_event can inspect the current world of a persistent session."""
+    start_result = await call_tool("start_session", {})
+    session_id = start_result[0].text.split("ID: ")[1].strip()
+
+    try:
+        await call_tool(
+            "evaluate",
+            {
+                "session_id": session_id,
+                "code": "(defun session-query-fn (x) (cons x x))",
+            },
+        )
+        result = await call_tool(
+            "query_event", {"name": "session-query-fn", "session_id": session_id}
+        )
+        text = result[0].text.upper()
+        assert "SESSION-QUERY-FN" in text, text
+        assert "CONS" in text, text
+    finally:
+        await call_tool("end_session", {"session_id": session_id})
+
+
+@pytest.mark.asyncio
+async def test_verify_guards_in_session() -> None:
+    """verify_guards can verify a function defined in a persistent session."""
+    start_result = await call_tool("start_session", {})
+    session_id = start_result[0].text.split("ID: ")[1].strip()
+
+    try:
+        await call_tool(
+            "evaluate",
+            {
+                "session_id": session_id,
+                "code": (
+                    "(defun session-guarded-fn (x)"
+                    " (declare (xargs :guard (consp x) :verify-guards nil))"
+                    " (car x))"
+                ),
+            },
+        )
+        result = await call_tool(
+            "verify_guards",
+            {"function_name": "session-guarded-fn", "session_id": session_id},
+        )
+        text = result[0].text
+        assert "FAILED" not in text and "ACL2 Error" not in text, text
+        assert "SESSION-GUARDED-FN" in text.upper(), text
+
+        # The verify-guards event belongs to the session world and is exported.
+        exported = await call_tool("export_session_code", {"session_id": session_id})
+        assert "verify-guards session-guarded-fn" in exported[0].text
+    finally:
+        await call_tool("end_session", {"session_id": session_id})
+
+
+@pytest.mark.asyncio
+async def test_query_and_verify_guard_reject_file_plus_session() -> None:
+    """file_path and session_id are mutually exclusive on these tools."""
+    query = await call_tool(
+        "query_event",
+        {"name": "append", "session_id": "s", "file_path": "/tmp/x.lisp"},
+    )
+    assert "cannot be combined" in query[0].text
+
+    verify = await call_tool(
+        "verify_guards",
+        {"function_name": "append", "session_id": "s", "file_path": "/tmp/x.lisp"},
+    )
+    assert "cannot be combined" in verify[0].text
+
+
+@pytest.mark.asyncio
+async def test_query_event_missing_session() -> None:
+    """A missing session is reported before a kernel is started."""
+    result = await call_tool(
+        "query_event", {"name": "append", "session_id": "missing-session"}
+    )
+    assert "not found" in result[0].text
 
 
 @pytest.mark.asyncio

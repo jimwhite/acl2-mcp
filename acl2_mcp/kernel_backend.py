@@ -27,7 +27,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 MIME_EVENTS = "application/vnd.acl2.events+json"
 
@@ -71,7 +71,7 @@ class CellResult:
     stdout: str = ""
     stderr: str = ""
     results: list[str] = field(default_factory=list)
-    error: Optional[dict] = None
+    error: Optional[dict[str, Any]] = None
     events: list[str] = field(default_factory=list)
     forms: list[str] = field(default_factory=list)
     package: str = "ACL2"
@@ -209,7 +209,7 @@ class KernelClient:
             merged_env.update(env)
 
         try:
-            from jupyter_client import KernelManager
+            from jupyter_client.manager import KernelManager
         except ImportError as exc:  # pragma: no cover - dependency error path
             raise KernelConfigError(
                 "jupyter_client is required for the ACL2 kernel backend; "
@@ -372,7 +372,9 @@ class KernelClient:
                 parent = reply.get("parent_header", {}).get("msg_id")
                 if parent and parent != msg_id:
                     continue
-                return reply.get("content", {}).get("status", "complete")
+                return str(
+                    reply.get("content", {}).get("status", "complete")
+                )
 
     def command_number(self, timeout: int = 10) -> int:
         """Return ACL2's current relative command number."""

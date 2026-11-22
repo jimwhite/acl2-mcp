@@ -32,7 +32,14 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ListToolsResult, CallToolResult
 
 # Set up file logging for debugging (ACL2_MCP_LOG_FILE overrides the path).
-_log_file = os.environ.get("ACL2_MCP_LOG_FILE", "/tmp/acl2-mcp-debug.log")
+# The default includes the uid so a root-run server and a vscode-run server do
+# not fight over one file; if the file cannot be opened, the fallback handler
+# must still stay at INFO or DEBUG transcript noise floods the MCP client's
+# stderr.
+_uid = getattr(os, "getuid", lambda: "user")()
+_log_file = os.environ.get(
+    "ACL2_MCP_LOG_FILE", f"/tmp/acl2-mcp-debug-{_uid}.log"
+)
 try:
     _file_handler = logging.FileHandler(_log_file)
     _file_handler.setLevel(logging.DEBUG)
@@ -40,7 +47,9 @@ try:
     _stream_handler.setLevel(logging.INFO)
     _log_handlers: list[logging.Handler] = [_file_handler, _stream_handler]
 except OSError:
-    _log_handlers = [logging.StreamHandler()]
+    _fallback_handler = logging.StreamHandler()
+    _fallback_handler.setLevel(logging.INFO)
+    _log_handlers = [_fallback_handler]
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -459,7 +468,9 @@ _ACL2_FAILURE_MARKERS = (
 
 def acl2_output_failed(output: str) -> bool:
     """Whether ACL2 output indicates the submission was not accepted."""
-    if output.startswith("Error: "):
+    # Server-generated failures ("Error: ...") may follow a parinfer note, so
+    # look for them at the start of any line, not just at the start of output.
+    if any(line.startswith("Error: ") for line in output.splitlines()):
         return True
     return any(marker in output for marker in _ACL2_FAILURE_MARKERS)
 
@@ -806,7 +817,10 @@ class SessionManager:
             if self._cleanup_task is None:
                 self._cleanup_task = asyncio.create_task(self._cleanup_inactive_sessions())
 
-            return session_id, f"Session started successfully. ID: {session_id}"
+            return session_id, (
+                "Session started successfully. Use the ID below as the "
+                f"session_id argument in later calls.\nID: {session_id}"
+            )
 
         except (KernelConfigError, KernelStartError) as e:
             logger.error(f"Failed to start session: {e}")
@@ -850,7 +864,11 @@ class SessionManager:
             age = time.time() - session.created_at
             idle = time.time() - session.last_activity
             name_str = f" ({session.name})" if session.name else ""
-            status = "" if session.is_alive() else " [terminated]"
+            status = (
+                ""
+                if session.is_alive()
+                else " [terminated] (call end_session to free the slot)"
+            )
             lines.append(
                 f"  {session_id}{name_str}: "
                 f"age={age:.0f}s, idle={idle:.0f}s, events={session.event_counter}, "
@@ -1184,7 +1202,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="query_event",
-            description="Look up the definition and properties of an ACL2 function, theorem, or macro. Use this to understand what's already defined before writing new code, or to check the signature of existing functions. Works with built-in ACL2 functions (e.g., 'append', 'len') or user-defined ones. Uses ACL2's :pe (print-event) command.",
+            description="Look up the definition and properties of an ACL2 function, theorem, or macro. Use this to understand what's already defined before writing new code, or to check the signature of existing functions. Works with built-in ACL2 functions (e.g., 'append', 'len') or user-defined ones. Uses ACL2's :pe (print-event) command. Pass session_id to query a persistent session's world; otherwise a fresh kernel is used, optionally after loading file_path.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -1194,7 +1212,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "file_path": {
                         "type": "string",
-                        "description": "Optional: Load this file first (WITH .lisp extension) before querying. Use if the event is defined in a specific file.",
+                        "description": "Optional: Load this file first (WITH .lisp extension) before querying. Use if the event is defined in a specific file. Cannot be combined with session_id.",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional: ID of a persistent session. Query the session's current world instead of starting a fresh kernel. Cannot be combined with file_path.",
                     },
                     "timeout": {
                         "type": "number",
@@ -1207,7 +1229,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="verify_guards",
-            description="Verify that a function's guards are satisfied, enabling efficient execution in raw Common Lisp. Guards are conditions that ensure a function is called with valid inputs. Use this after defining a function to enable faster execution. Common workflow: 1) Define function with 'evaluate', 2) Verify guards with this tool. Example: After defining (defun my-div (x y) (/ x y)), verify guards to ensure y is never zero.",
+            description="Verify that a function's guards are satisfied, enabling efficient execution in raw Common Lisp. Guards are conditions that ensure a function is called with valid inputs. Use this after defining a function to enable faster execution. Pass session_id to verify a function defined in a persistent session; otherwise a fresh kernel is used, optionally after loading file_path. Common workflow: 1) Define function with 'evaluate', 2) Verify guards with this tool. Example: After defining (defun my-div (x y) (/ x y)), verify guards to ensure y is never zero.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -1217,7 +1239,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "file_path": {
                         "type": "string",
-                        "description": "Optional: File containing the function (WITH .lisp extension). Load this first before verifying.",
+                        "description": "Optional: File containing the function (WITH .lisp extension). Load this before verifying. Cannot be combined with session_id.",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional: ID of a persistent session. Verify a function in the session's current world instead of starting a fresh kernel. Cannot be combined with file_path.",
                     },
                     "timeout": {
                         "type": "number",
@@ -2316,11 +2342,13 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         check_var = "acl2::acl2-mcp-check-event"
         no_event_marker = "___ACL2_MCP_NO_SUCH_EVENT___"
         undo_failed_marker = "___ACL2_MCP_UNDO_FAILED___"
+        reproof_marker = "___ACL2_MCP_REPROOF_BEGIN___"
         code = (
             f'(ld "{escaped_path}")\n'
             f"(acl2::assign {check_var} "
             f"(acl2::get-event '{validated_theorem} (acl2::w acl2::state)))\n"
             f":ubt {validated_theorem}\n"
+            f'(acl2::cw "{reproof_marker}~%")\n'
             f"(acl2::if (acl2::@ {check_var})\n"
             f"    (acl2::if (acl2::get-event '{validated_theorem} (acl2::w acl2::state))\n"
             f'        (acl2::cw "{undo_failed_marker}~%")\n'
@@ -2328,8 +2356,29 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             f'    (acl2::cw "{no_event_marker}~%"))'
         )
         output = await run_acl2(code, timeout, cwd=file_dir)
+        cleaned = clean_acl2_output(output)
+        # (ld "file") leaves a bare package result at the front of the transcript.
+        cleaned = re.sub(r'^\s*"ACL2"\s*\n', "", cleaned)
+
+        # Split at the internal marker before removing it; the prefix is the
+        # file load and the suffix is the actual re-proof.
+        if reproof_marker in cleaned:
+            load_output, reproof_output = cleaned.split(reproof_marker, 1)
+        else:
+            # A timeout or launch failure never reached the marker.
+            load_output, reproof_output = "", cleaned
+        cleaned = re.sub(
+            r"(?m)^" + re.escape(reproof_marker) + r"\s*$\n?", "", cleaned
+        ).strip()
 
         if no_event_marker in output:
+            load_output = cleaned.replace(no_event_marker, "")
+            # The generated code still issues :ubt for a name that does not
+            # exist; drop that expected error (and its trailing NILs) so the
+            # real diagnosis is not buried.
+            load_output = re.sub(
+                r"(?ms)^ACL2 Error in :UBT:.*\Z", "", load_output
+            ).strip()
             return [
                 TextContent(
                     type="text",
@@ -2337,27 +2386,42 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                         f"Error: No event named '{validated_theorem}' was introduced "
                         f"by {abs_path}. The name may be misspelled, or an earlier "
                         "form in the file may have failed to admit. Load output:\n\n"
-                        f"{output.replace(no_event_marker, '').strip()}"
+                        f"{load_output}"
                     ),
                 )
             ]
 
         if undo_failed_marker in output:
+            undo_detail = cleaned.replace(undo_failed_marker, "").strip()
             return [
                 TextContent(
                     type="text",
                     text=(
                         f"Error: Could not undo the event '{validated_theorem}' "
                         f"(it may come from an included book rather than {abs_path.name}).\n\n"
-                        f"{output}"
+                        f"{undo_detail}"
                     ),
                 )
             ]
 
+        load_failed = bool(load_output.strip()) and acl2_output_failed(load_output)
+        if acl2_output_failed(reproof_output):
+            status = f"Theorem '{validated_theorem}' FAILED to re-prove."
+        elif load_failed:
+            status = (
+                f"Theorem '{validated_theorem}' re-proved successfully, but "
+                "loading the file reported errors."
+            )
+        else:
+            status = f"Theorem '{validated_theorem}' re-proved successfully."
+
+        # On a clean load, return just the re-proof; otherwise keep the load
+        # transcript so its errors are visible.
+        body = cleaned if load_failed else reproof_output.strip()
         return [
             TextContent(
                 type="text",
-                text=output,
+                text=f"{status}\n\n{body}",
             )
         ]
 
@@ -2439,9 +2503,37 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
     elif name == "query_event":
         name_arg = arguments["name"]
         file_path = arguments.get("file_path", "")
+        session_id = arguments.get("session_id")
         timeout = arguments.get("timeout", 30)
 
-        output = await query_acl2_event(name_arg, file_path, timeout)
+        if session_id:
+            if file_path:
+                return [
+                    TextContent(
+                        type="text",
+                        text="Error: session_id and file_path cannot be combined.",
+                    )
+                ]
+            session = session_manager.get_session(session_id)
+            if not session:
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Error: Session {session_id} not found",
+                    )
+                ]
+            try:
+                validated_name = validate_acl2_identifier(name_arg)
+            except ValueError as e:
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Error: {e}",
+                    )
+                ]
+            output = await session.send_command(f":pe {validated_name}", timeout)
+        else:
+            output = await query_acl2_event(name_arg, file_path, timeout)
 
         return [
             TextContent(
@@ -2453,9 +2545,41 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
     elif name == "verify_guards":
         function_name = arguments["function_name"]
         file_path = arguments.get("file_path", "")
+        session_id = arguments.get("session_id")
         timeout = arguments.get("timeout", 60)
 
-        output = await verify_function_guards(function_name, file_path, timeout)
+        if session_id:
+            if file_path:
+                return [
+                    TextContent(
+                        type="text",
+                        text="Error: session_id and file_path cannot be combined.",
+                    )
+                ]
+            session = session_manager.get_session(session_id)
+            if not session:
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Error: Session {session_id} not found",
+                    )
+                ]
+            try:
+                validated_name = validate_acl2_identifier(function_name)
+            except ValueError as e:
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Error: {e}",
+                    )
+                ]
+            command = f"(verify-guards {validated_name})"
+            before = session.event_counter
+            output = await session.send_command(command, timeout)
+            if not acl2_output_failed(output) and session.event_counter > before:
+                session.record_accepted(command, session.event_counter)
+        else:
+            output = await verify_function_guards(function_name, file_path, timeout)
 
         return [
             TextContent(
@@ -2639,11 +2763,20 @@ async def handle_call_tool(_ctx: Any, params: Any) -> CallToolResult:
             is_error=True,
         )
     # Tool handlers report validation and execution failures as text.  Mirror
-    # that in isError so MCP clients can react without string matching.
-    is_error = any(
-        block.text.startswith(("Error:", "Syntax errors found"))
-        for block in content
-        if isinstance(block, TextContent)
+    # that in isError so MCP clients can react without string matching.  ACL2's
+    # own failures say "ACL2 Error" or "******** FAILED ********" rather than
+    # starting with "Error:" (and a parinfer note may precede either), so use
+    # the shared failure detector; the syntax-check statuses are not ACL2
+    # transcripts and need their own prefixes.
+    combined = "\n".join(
+        block.text for block in content if isinstance(block, TextContent)
+    )
+    is_error = acl2_output_failed(combined) or combined.startswith(
+        (
+            "Syntax errors found",
+            "Syntax check timed out",
+            "Syntax check could not run",
+        )
     )
     return CallToolResult(content=list(content), is_error=is_error)
 

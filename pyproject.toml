@@ -41,6 +41,7 @@ disallow_untyped_defs = true
 acl2-mcp = "acl2_mcp.server:main"
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "acl2: test requires a working ACL2 executable (ACL2 environment variable or acl2 on PATH)",
