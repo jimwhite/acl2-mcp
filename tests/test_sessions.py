@@ -13,6 +13,8 @@ from acl2_mcp.server import (
     validate_integer_parameter,
 )
 
+pytestmark = pytest.mark.acl2
+
 
 @pytest.mark.asyncio
 async def test_start_session() -> None:

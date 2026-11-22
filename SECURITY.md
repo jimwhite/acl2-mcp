@@ -30,8 +30,10 @@ The ACL2 MCP server executes arbitrary ACL2 code provided by the client. This is
 ### 1. Input Validation
 
 **ACL2 Identifiers** (`validate_acl2_identifier`):
-- Rejects identifiers containing quotes (`"`, `'`)
-- Rejects identifiers containing parentheses (`(`, `)`)
+- Accepts only plain ACL2 symbols: letters, digits, and the punctuation
+  `! $ % & * + - . / : < = > ? @ ^ _ ~`
+- Rejects quotes, parentheses, whitespace/newlines, and `;`, so a name cannot
+  break out of the surrounding form or inject a top-level command
 - Prevents code injection through function/theorem names
 
 **Timeout Values** (`validate_timeout`):
@@ -78,8 +80,8 @@ The ACL2 MCP server executes arbitrary ACL2 code provided by the client. This is
 - Allows reading any file the process can access
 - Suitable for local single-user usage only
 
-**Output Path Validation** (`validate_output_path`, used by `check_syntax` and
-`export_session_code` when `file_path` is given):
+**Output Path Validation** (`validate_output_path`, used by `check_syntax`,
+`parinfer`, and `export_session_code` when an output path is given):
 - Resolves to absolute paths
 - Requires the parent directory to exist
 - Rejects directory targets
@@ -103,6 +105,8 @@ The ACL2 MCP server executes arbitrary ACL2 code provided by the client. This is
 **Timeout Protection**:
 - True total timeout (not per-line) prevents slow-read attacks
 - Cryptographically random markers prevent injection
+- A timed-out session command kills that ACL2 process, preventing a blocked
+  reader from desynchronizing later commands (state is not preserved)
 - Timeout applies to both one-off and session commands
 
 **Concurrency Protection**:
@@ -110,21 +114,30 @@ The ACL2 MCP server executes arbitrary ACL2 code provided by the client. This is
 - Race-condition-safe cleanup with session snapshots
 - Safe shutdown handles all active sessions
 
+**Stderr Handling**:
+- Each session has a background task draining stderr into a bounded deque
+- A chatty ACL2 process therefore cannot block on a full stderr pipe
+
 ### 6. Error Handling
 
-- Generic error messages to avoid information disclosure
-- No stack traces exposed to client
-- File paths in errors show basename only
-- Internal exceptions sanitized before returning to user
+- Missing ACL2 executables return a clear tool error with the executable path
+- Missing required arguments are reported as tool errors, not KeyErrors
+- Unknown tools and validation failures return `isError` tool results
+- Unexpected internal exceptions are logged server-side and returned generically
+- ACL2's own transcript is returned to the caller by design (it is the result)
+- File-path errors may include the requested path so the user can correct it
 
 ## Tested Attack Vectors
 
 The following attack vectors have been tested and mitigated:
 
-1. **Code Injection via Identifiers**: `name='append")(+ 1 1)'`
+1. **Code Injection via Identifiers**: `name='append")(+ 1 1)'`,
+   `name='append\n:pe car'`, `name='append; comment'`
 2. **Code Injection via Paths**: `path='test")(malicious-code)'`
 3. **Resource Exhaustion**: 2MB code, 1000 second timeout
 4. **Path Traversal**: Non-existent files, directories
+5. **Argument Abuse**: Missing required fields (`undo {}`), invalid names and
+   modes, conflicting `code`/`input_path`, and unwritable output paths
 
 See `tests/test_security.py` for complete test coverage.
 
@@ -150,20 +163,24 @@ See `tests/test_security.py` for complete test coverage.
 - **Mitigation**: Suitable for single-user local deployment only
 
 **Write-Capable Tools**:
-- `check_syntax` with `file_path` and `export_session_code` with `file_path`
-  write files on the server's filesystem
-- Existing files are only replaced when `overwrite: true` is passed
+- `check_syntax` and `parinfer` write through `output_path`/`file_path` or
+  `in_place`; `export_session_code` writes through `file_path`
+- Existing files are only replaced when `overwrite: true` is passed (except
+  `in_place`, which explicitly replaces the input file)
 - No directory confinement: the server can write anywhere the process can
 - **Mitigation**: Only use with trusted clients and users
 
-**Stderr Not Monitored in Sessions**:
-- stderr buffer could fill and cause process blocking
-- Error information may be lost
-- **Mitigation**: Use one-off execution for critical operations
+**Session stderr content**:
+- stderr is drained and only a bounded tail is retained for debugging; it is
+  not included in ordinary tool results
+- Error information printed only to stderr may therefore be lost
+- **Mitigation**: Use one-off execution when complete stderr is needed
 
 ## Best Practices for Deployment
 
-1. **Run Locally Only**: Never expose this server over a network
+1. **Run Locally Only**: Prefer stdio. If you use `mcp-proxy` for HTTP, keep it
+   bound to localhost and add authentication before exposing it; the server has
+   no authentication of its own
 2. **Trusted Clients**: Only allow trusted clients (e.g., ZCode)
 3. **Single User**: Do not use in multi-user or multi-tenant environments
 4. **Trusted Code**: Only execute ACL2 code you trust (ACL2 has full system access)

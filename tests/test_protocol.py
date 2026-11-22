@@ -38,6 +38,17 @@ async def test_connects_in_modern_era_and_lists_tools() -> None:
 
 
 @pytest.mark.asyncio
+async def test_validation_error_is_a_tool_error() -> None:
+    """Validation failures are also reported via isError."""
+    async with Client(_server_params(), mode="auto") as client:
+        result = await client.call_tool("query_event", {"name": 'append")(+ 1 1)'})
+
+        assert result.is_error
+        text = "".join(getattr(block, "text", "") for block in result.content)
+        assert "Invalid ACL2 identifier" in text
+
+
+@pytest.mark.asyncio
 async def test_unknown_tool_is_a_tool_error() -> None:
     """An unknown tool is reported via isError, not a JSON-RPC failure."""
     async with Client(_server_params(), mode="auto") as client:

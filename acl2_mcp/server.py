@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Any, Sequence, Optional
@@ -51,6 +52,17 @@ MAX_EXPORT_LENGTH = 10_000_000  # Maximum accumulated source returned by an expo
 DEFAULT_PARINFER_LIB = "/usr/local/lib/libparinfer_rust.so"
 PARINFER_MODES = ("indent", "paren", "smart")
 DEFAULT_PARINFER_MODE = "indent"  # indent mode: derive parens from indentation
+DEFAULT_CHECK_SYNTAX_TIMEOUT = 5
+MAX_STDERR_LINES = 200
+ACL2_PROMPT = "ACL2 !>"
+# Set ACL2_MCP_RAW_OUTPUT=1 to keep the startup banner and prompts in results.
+RAW_OUTPUT = os.environ.get("ACL2_MCP_RAW_OUTPUT", "").lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+)
+_ACL2_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9!$%&*+\-./:<=>?@^_~]+$")
 
 
 def validate_timeout(timeout: int) -> int:
@@ -84,9 +96,10 @@ def validate_acl2_identifier(identifier: str) -> str:
     if not identifier:
         raise ValueError("Identifier cannot be empty")
 
-    # ACL2 identifiers can contain letters, digits, hyphens, underscores
-    # and some special characters, but should not contain quotes or parens
-    if '"' in identifier or "'" in identifier or "(" in identifier or ")" in identifier:
+    # Accept only a plain ACL2 symbol.  Besides the obvious quote/paren cases,
+    # this rejects whitespace, newlines, and ';' so a name cannot terminate the
+    # surrounding form or inject an extra top-level command.
+    if not _ACL2_IDENTIFIER_RE.match(identifier):
         raise ValueError(f"Invalid ACL2 identifier: {identifier}")
 
     return identifier
@@ -451,6 +464,46 @@ def acl2_output_failed(output: str) -> bool:
     return any(marker in output for marker in _ACL2_FAILURE_MARKERS)
 
 
+def clean_acl2_output(output: str) -> str:
+    """Remove the startup banner and interactive prompts from a transcript.
+
+    The prompts and the version banner are noise for tool callers and make
+    values hard to parse.  Set ACL2_MCP_RAW_OUTPUT=1 to keep the raw transcript
+    for debugging.
+    """
+    if RAW_OUTPUT or not output:
+        return output
+
+    # Drop the startup banner through the first prompt, but only when this
+    # really looks like a fresh-process transcript (not an error message).
+    if "Welcome to" in output[:2000]:
+        prompt_at = output.find(ACL2_PROMPT)
+        if prompt_at != -1:
+            output = output[prompt_at + len(ACL2_PROMPT) :]
+
+    # Prompts appear at the start of a line (sometimes immediately before the
+    # value printed by the next top-level form).
+    output = re.sub(r"(?m)^ACL2 !>+", "", output)
+    lines = output.splitlines()
+    # Remove blank lines left behind by the final prompt, but preserve
+    # meaningful internal blank lines.
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
+
+
+def parinfer_unavailable_note(enabled: bool) -> str:
+    """A visible note when balancing was requested but cannot be performed."""
+    if enabled and not parinfer_available():
+        return (
+            "[parinfer unavailable; code submitted unchanged. "
+            "Set PARINFER_LIB to enable balancing.]\n\n"
+        )
+    return ""
+
+
 def validate_checkpoint_name(name: str) -> str:
     """
     Validate checkpoint name for safety.
@@ -537,6 +590,13 @@ class SessionCheckpoint:
 
 
 @dataclass
+class AcceptedForm:
+    """Source accepted into a session, tagged with the last event it created."""
+    code: str
+    event_number: int
+
+
+@dataclass
 class ACL2Session:
     """Represents a persistent ACL2 session."""
     session_id: str
@@ -550,9 +610,11 @@ class ACL2Session:
     banner_consumed: bool = False
     parinfer_enabled: bool = True
     parinfer_mode: str = DEFAULT_PARINFER_MODE
-    accepted_code: list[str] = field(default_factory=list)
+    accepted_code: list[AcceptedForm] = field(default_factory=list)
     accepted_code_size: int = 0
     alive: bool = True
+    stderr_tail: deque[str] = field(default_factory=lambda: deque(maxlen=MAX_STDERR_LINES))
+    stderr_task: Optional[asyncio.Task[None]] = None
 
     def is_alive(self) -> bool:
         """Whether the underlying ACL2 process can still accept commands."""
@@ -567,6 +629,80 @@ class ACL2Session:
                     f"(saved at event {self.checkpoints[name].event_number}, now at {event_number})"
                 )
                 del self.checkpoints[name]
+
+    def prune_accepted_after(self, event_number: int) -> None:
+        """Drop exported forms whose events are no longer in the world."""
+        kept: list[AcceptedForm] = []
+        for form in self.accepted_code:
+            if form.event_number > event_number:
+                self.accepted_code_size -= len(form.code)
+            else:
+                kept.append(form)
+        self.accepted_code = kept
+
+    async def drain_stderr(self) -> None:
+        """Keep the stderr pipe drained so ACL2 cannot block on a full buffer."""
+        if self.process.stderr is None:
+            return
+        try:
+            while True:
+                line = await self.process.stderr.readline()
+                if not line:
+                    break
+                text = line.decode(errors="replace").rstrip()
+                self.stderr_tail.append(text)
+                logger.debug(f"Session {self.session_id} stderr: {text}")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                f"Session {self.session_id}: stderr reader stopped",
+                exc_info=True,
+            )
+
+    async def _consume_prompt(self, timeout: float = 1.0) -> None:
+        """Consume the marker form's printed value and the following prompt.
+
+        The completion probe is a top-level form, so ACL2 prints its return
+        value (NIL) and then a fresh prompt after the marker line.  Leaving
+        those bytes in the pipe makes them look like the next command's output.
+        Best-effort: a failure here must not break the command.
+        """
+        if self.process.stdout is None:
+            return
+        try:
+            await asyncio.wait_for(
+                self.process.stdout.readuntil(ACL2_PROMPT.encode()), timeout=timeout
+            )
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+            pass
+        except Exception:
+            logger.debug(
+                f"Session {self.session_id}: could not consume trailing prompt",
+                exc_info=True,
+            )
+
+    async def terminate_after_timeout(self, timeout: int) -> str:
+        """Kill a session whose command timed out, to avoid reader desync."""
+        self.alive = False
+        try:
+            self.process.kill()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            logger.debug(
+                f"Session {self.session_id}: kill after timeout failed",
+                exc_info=True,
+            )
+        try:
+            await asyncio.wait_for(self.process.wait(), timeout=5.0)
+        except Exception:
+            pass
+        return (
+            f"Error: Command execution timed out after {timeout} seconds. "
+            "The ACL2 process was terminated to avoid a desynchronized reader; "
+            "start a new session to continue."
+        )
 
     def _record_command_number(self, line: str, marker: str) -> bool:
         """Parse the command number printed with a marker; return whether it parsed."""
@@ -592,6 +728,7 @@ class ACL2Session:
         """
         async with self.lock:
             self.last_activity = time.time()
+            starting_event = self.event_counter
 
             if not self.is_alive():
                 self.alive = False
@@ -632,6 +769,8 @@ class ACL2Session:
                                 lines_read += 1
                                 if banner_marker in line.decode():
                                     logger.info(f"Session {self.session_id}: Banner consumed after {lines_read} lines")
+                                    # Consume the no-op's NIL value and prompt too.
+                                    await self._consume_prompt()
                                     break
                             except asyncio.TimeoutError:
                                 continue
@@ -725,6 +864,7 @@ class ACL2Session:
                                                 # An aborted command may not have changed
                                                 # the world; keep the last known number.
                                                 reported_command_number = True
+                                                await self._consume_prompt()
                                                 break
                                         except asyncio.TimeoutError:
                                             continue
@@ -735,12 +875,18 @@ class ACL2Session:
                             continue
 
                     if not marker_found:
-                        return f"Error: Command execution timed out after {timeout} seconds"
+                        return await self.terminate_after_timeout(timeout)
+
+                    # Consume the probe form's return value and the prompt so
+                    # they do not leak into the next command's output.
+                    await self._consume_prompt()
 
                 except Exception:
                     return "Error: Session communication failed"
 
-                output = "".join(output_lines).replace(marker, "").strip()
+                output = clean_acl2_output(
+                    "".join(output_lines).replace(marker, "")
+                )
 
                 if not reported_command_number:
                     # Fallback for ACL2 builds without the command-number
@@ -748,6 +894,13 @@ class ACL2Session:
                     # one event.
                     if not command.lstrip().startswith(":") and not acl2_output_failed(output):
                         self.event_counter += 1
+
+                # A backtrack (undo, checkpoint restore, or a raw :ubt sent
+                # through evaluate) invalidates checkpoints and exported forms
+                # above the new event count.
+                if self.event_counter < starting_event:
+                    self.prune_checkpoints_after(self.event_counter)
+                    self.prune_accepted_after(self.event_counter)
 
                 return output
 
@@ -759,20 +912,22 @@ class ACL2Session:
                 # SECURITY: Don't leak internal details in error messages
                 return "Error: Failed to execute command in session"
 
-    def record_accepted(self, code: str) -> None:
-        """Record source that ACL2 accepted, up to the export size cap."""
+    def record_accepted(self, code: str, event_number: int) -> None:
+        """Record source that created event(s), up to the export size cap."""
         if self.accepted_code_size + len(code) > MAX_EXPORT_LENGTH:
             logger.warning(
                 f"Session {self.session_id}: accepted source cap "
                 f"({MAX_EXPORT_LENGTH} characters) reached; not recording more"
             )
             return
-        self.accepted_code.append(code)
+        self.accepted_code.append(AcceptedForm(code=code, event_number=event_number))
         self.accepted_code_size += len(code)
 
     async def terminate(self) -> None:
         """Terminate the ACL2 session."""
         self.alive = False
+        if self.stderr_task is not None and not self.stderr_task.done():
+            self.stderr_task.cancel()
         try:
             if self.process.stdin:
                 try:
@@ -789,6 +944,11 @@ class ACL2Session:
         except Exception:
             self.process.kill()
             await self.process.wait()
+        if self.stderr_task is not None:
+            try:
+                await self.stderr_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 def resolve_parinfer(arguments: Any, session: Optional[ACL2Session]) -> tuple[bool, str]:
@@ -874,6 +1034,10 @@ class SessionManager:
                 parinfer_mode=parinfer_mode,
             )
 
+            # Drain stderr for the life of the session so a full pipe cannot
+            # block ACL2.
+            session.stderr_task = asyncio.create_task(session.drain_stderr())
+
             self.sessions[session_id] = session
             logger.info(f"Session {session_id} created (banner will be consumed on first command)")
 
@@ -883,6 +1047,12 @@ class SessionManager:
 
             return session_id, f"Session started successfully. ID: {session_id}"
 
+        except OSError as e:
+            logger.error(f"Failed to start session: {e}")
+            return "", (
+                f"Error: Could not start ACL2 executable '{acl2_executable}': {e}. "
+                "Set the ACL2 environment variable to the ACL2 binary."
+            )
         except Exception as e:
             # SECURITY: Don't leak internal error details
             logger.error(f"Failed to start session: {e}")
@@ -1001,7 +1171,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="start_session",
             description="Start a new persistent ACL2 session. This creates a long-running ACL2 process that maintains state across multiple tool calls. Use this when you want to incrementally build up definitions and theorems without having to wrap everything in progn. Sessions auto-timeout after 30 minutes of inactivity.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "name": {
@@ -1025,7 +1195,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="end_session",
             description="End a persistent ACL2 session and clean up resources. Use this when you're done with incremental development. Sessions also auto-cleanup after 30 minutes of inactivity.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "session_id": {
@@ -1039,7 +1209,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="list_sessions",
             description="List all active ACL2 sessions with their IDs, names, age, idle time, and event count. Use this to see which sessions are available and their current state.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {},
             },
@@ -1047,7 +1217,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="prove",
             description="Submit an ACL2 theorem (defthm) for proof. Use this to prove mathematical properties. Example: (defthm append-nil (implies (true-listp x) (equal (append x nil) x))). Input is either inline code or an input_path file. The theorem will be proven and added to the ACL2 world. Returns detailed ACL2 proof output. Can optionally use a persistent session for incremental development.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "code": {
@@ -1077,7 +1247,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="evaluate",
             description="Evaluate ACL2 expressions or define functions (defun). Use this for: 1) Defining functions, 2) Computing values, 3) Testing expressions. Example: (defun factorial (n) (if (zp n) 1 (* n (factorial (- n 1))))) or (+ 1 2). Input is either inline code or an input_path file. Returns the ACL2 evaluation result. Can optionally use a persistent session for incremental development.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "code": {
@@ -1106,8 +1276,8 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="check_syntax",
-            description="Quickly check ACL2 code for syntax errors without full execution. Input is either inline code or an input_path file. By default the code is first balanced with parinfer (indent mode). On success, return the balanced source, write it to a different file (output_path/file_path), or rewrite the input file in place (in_place). Use this before 'admit' or 'prove' to catch basic errors. Faster than full evaluation but less thorough.",
-            inputSchema={
+            description="Check ACL2 code for reader/syntax errors. Input is either inline code or an input_path file. By default the code is first balanced with parinfer (indent mode), so mismatched parens may be silently repaired; pass parinfer=false to validate the literal source. The balanced code is then fed to ACL2 for a short bounded run: only reader errors count as syntax errors, while admission failures and aborts are reported separately. On success, return the balanced source, write it to a different file (output_path/file_path), or rewrite the input file in place (in_place). Use 'admit' or 'prove' to establish that events are accepted.",
+            input_schema={
                 "type": "object",
                 "properties": {
                     "code": {
@@ -1122,6 +1292,11 @@ async def list_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "Balance the code with parinfer before checking (default: true)",
                         "default": True,
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "description": "Bounded ACL2 run time in seconds (default: 5, max: 300)",
+                        "default": DEFAULT_CHECK_SYNTAX_TIMEOUT,
                     },
                     "return_source": {
                         "type": "boolean",
@@ -1151,13 +1326,13 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="certify_book",
-            description="Certify an ACL2 book (a collection of definitions and theorems in a .lisp file). This verifies all proofs and creates a certificate for the book. Use this after creating a complete ACL2 book file. IMPORTANT: Provide path WITHOUT the .lisp extension (e.g., 'mybook' not 'mybook.lisp').",
-            inputSchema={
+            description="Certify an ACL2 book (a collection of definitions and theorems in a .lisp file). This verifies all proofs and creates a certificate for the book. Use this after creating a complete ACL2 book file. Provide the path WITHOUT the .lisp extension (a trailing .lisp is also accepted). An adjacent <book>.acl2 or cert.acl2 file is loaded first when present, and a '; cert-flags:' comment in it is honored.",
+            input_schema={
                 "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Path to the book WITHOUT .lisp extension. Example: '/path/to/mybook' for file '/path/to/mybook.lisp'",
+                        "description": "Path to the book, normally WITHOUT .lisp extension. Example: '/path/to/mybook' for file '/path/to/mybook.lisp'",
                     },
                     "timeout": {
                         "type": "number",
@@ -1170,8 +1345,8 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="include_book",
-            description="Load a certified ACL2 book to use its definitions and theorems. Use this to import existing ACL2 libraries before proving new theorems. Optionally run additional code after loading. IMPORTANT: Provide path WITHOUT .lisp extension.",
-            inputSchema={
+            description="Load a certified ACL2 book to use its definitions and theorems. Use this to import existing ACL2 libraries before proving new theorems. Optionally run additional code after loading. A local book path (with or without .lisp) is used directly; any other name is resolved against ACL2's system book directory. IMPORTANT: Provide path WITHOUT .lisp extension.",
+            input_schema={
                 "type": "object",
                 "properties": {
                     "file_path": {
@@ -1181,6 +1356,11 @@ async def list_tools() -> list[Tool]:
                     "code": {
                         "type": "string",
                         "description": "Optional ACL2 code to run after loading the book. Example: (thm (equal (+ 1 1) 2))",
+                    },
+                    "parinfer": {
+                        "type": "boolean",
+                        "description": "Balance the optional code with parinfer before running it (default: true)",
+                        "default": True,
                     },
                     "timeout": {
                         "type": "number",
@@ -1194,7 +1374,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="check_theorem",
             description="Verify a specific theorem from a file. Use this to re-check a single theorem after making changes, without re-proving everything in the file. The file is loaded first, then the named theorem is proven. File path INCLUDES .lisp extension.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "file_path": {
@@ -1216,8 +1396,8 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="admit",
-            description="Test if an ACL2 event would be accepted WITHOUT saving it permanently. Use this to validate definitions/theorems before adding them to files. Input is either an inline event or an input_path file. Faster than 'prove' for testing. Returns success/failure. Example use case: testing if a function definition is valid before committing to a file. Can optionally use a persistent session to test in context of existing definitions.",
-            inputSchema={
+            description="Test if an ACL2 event would be accepted without keeping it. In a persistent session the event is checked in the session's context and then rolled back with :ubt, so it does not change the world and is not exported. Without a session, a fresh ACL2 process is used and discarded. Input is either an inline event or an input_path file. Returns success/failure. Use 'prove' or 'evaluate' when you want the event to persist.",
+            input_schema={
                 "type": "object",
                 "properties": {
                     "code": {
@@ -1247,7 +1427,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="query_event",
             description="Look up the definition and properties of an ACL2 function, theorem, or macro. Use this to understand what's already defined before writing new code, or to check the signature of existing functions. Works with built-in ACL2 functions (e.g., 'append', 'len') or user-defined ones. Uses ACL2's :pe (print-event) command.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "name": {
@@ -1270,7 +1450,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="verify_guards",
             description="Verify that a function's guards are satisfied, enabling efficient execution in raw Common Lisp. Guards are conditions that ensure a function is called with valid inputs. Use this after defining a function to enable faster execution. Common workflow: 1) Define function with 'evaluate', 2) Verify guards with this tool. Example: After defining (defun my-div (x y) (/ x y)), verify guards to ensure y is never zero.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "function_name": {
@@ -1293,7 +1473,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="undo",
             description="Undo the last ACL2 event in a persistent session. This removes the most recent definition, theorem, or command from the session's world. Use this to backtrack and try alternative approaches. Uses ACL2's :ubt (undo-back-through) command. Only works with persistent sessions.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "session_id": {
@@ -1312,7 +1492,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="save_checkpoint",
             description="Save a named checkpoint of the current ACL2 world state in a session. You can later restore to this checkpoint to try alternative proof strategies. Use this before attempting risky proof steps or when you want to preserve a known-good state.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "session_id": {
@@ -1330,7 +1510,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="restore_checkpoint",
             description="Restore a session to a previously saved checkpoint. This undoes all events that occurred after the checkpoint was created. Use this to backtrack to a known-good state and try a different approach.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "session_id": {
@@ -1348,7 +1528,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="get_world_state",
             description="Display the current ACL2 world state in a session, showing all definitions, theorems, and events. Use this to see what's currently defined in your session. Uses ACL2's :pbt (print-back-through) command.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "session_id": {
@@ -1366,13 +1546,13 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="retry_proof",
-            description="Retry the last proof attempt in a session with different hints or strategies. Input is either inline code or an input_path file. This is useful for interactive proof debugging - when a proof fails, you can try again with modified hints without re-submitting the entire theorem. Failed proofs do not change the ACL2 world, so no undo is needed; the new attempt is simply submitted.",
-            inputSchema={
+            description="Submit another proof attempt in a session, typically with different hints or strategies after a failed proof. Input is either inline code or an input_path file. This tool submits the code as-is; it does not undo a previous attempt or verify that one failed. It balances with parinfer by default, like the other code tools. Successful submissions that add events are included in export_session_code.",
+            input_schema={
                 "type": "object",
                 "properties": {
                     "session_id": {
                         "type": "string",
-                        "description": "ID of the session with the failed proof",
+                        "description": "ID of the session to submit the proof attempt to",
                     },
                     "code": {
                         "type": "string",
@@ -1387,6 +1567,10 @@ async def list_tools() -> list[Tool]:
                         "description": "Timeout in seconds (default: 60)",
                         "default": 60,
                     },
+                    "parinfer": {
+                        "type": "boolean",
+                        "description": "Override the session's parinfer setting for this call (default: session setting; true without a session)",
+                    },
                 },
                 "required": ["session_id"],
             },
@@ -1394,7 +1578,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="parinfer",
             description="Balance Lisp/ACL2 parentheses and indentation with parinfer. Input is either inline code or an input_path file. Indent mode is the default: parentheses are derived from indentation, which suits code written in bulk (LLMs are usually good at indentation but miss parens). Use 'paren' mode to validate existing parens and fix indentation instead. Returns the balanced source, or writes it to a different file (output_path/file_path) or back to the input file (in_place).",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "code": {
@@ -1439,8 +1623,8 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="export_session_code",
-            description="Export the source code that a persistent session accepted (submissions that produced no ACL2 errors). Without file_path, returns the source text. With file_path, writes the source to that file and returns only a confirmation with the path, line count, and character count.",
-            inputSchema={
+            description="Export the source of events accepted into a persistent session that are still in its current world. This is a server-tracked submission log, not a full world dump: non-event evaluations are skipped, forms removed by undo/checkpoint restore are pruned, and events added outside these tools (for example by an included book) are not recovered. A submission that added several events is tracked as one unit, so undoing part of it drops the whole recorded form. Without file_path, returns the source text. With file_path, writes the source to that file and returns only a confirmation with the path, line count, and character count.",
+            input_schema={
                 "type": "object",
                 "properties": {
                     "session_id": {
@@ -1504,14 +1688,20 @@ async def run_acl2(code: str, timeout: int = 30, cwd: str | None = None) -> str:
         acl2_executable = env.get('ACL2', 'acl2')
         logger.debug(f"Running ACL2 ({acl2_executable}) with cwd={cwd}")
         
-        process = await asyncio.create_subprocess_exec(
-            acl2_executable,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-            env=env,
-        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                acl2_executable,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+            )
+        except OSError as e:
+            return (
+                f"Error: Could not start ACL2 executable '{acl2_executable}': {e}. "
+                "Set the ACL2 environment variable to the ACL2 binary."
+            )
 
         # Read the temp file and send to ACL2
         with open(temp_file, "r") as f:
@@ -1533,7 +1723,7 @@ async def run_acl2(code: str, timeout: int = 30, cwd: str | None = None) -> str:
             if error_output.strip():
                 output += f"\n\nStderr:\n{error_output}"
 
-        return output
+        return clean_acl2_output(output)
     finally:
         Path(temp_file).unlink(missing_ok=True)
 
@@ -1750,6 +1940,11 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             parinfer_enabled=bool(parinfer_enabled),
             parinfer_mode=parinfer_mode,
         )
+        if session_id and bool(parinfer_enabled) and not parinfer_available():
+            message += (
+                "\nWarning: parinfer library unavailable; submissions will not be "
+                "balanced. Set PARINFER_LIB to the parinfer-rust shared library."
+            )
         return [
             TextContent(
                 type="text",
@@ -2039,14 +2234,31 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        # A failed proof does not add an event, so there is nothing to undo.
-        # (Undoing here used to delete the last *successful* event instead.)
-        output = await session.send_command(code, timeout)
+        use_parinfer, parinfer_mode = resolve_parinfer(arguments, session)
+        balanced, parinfer_error = await balance_if_enabled(
+            code, use_parinfer, parinfer_mode
+        )
+        if parinfer_error:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: parinfer could not balance the code: {parinfer_error}\n"
+                    "(Use parinfer=false to submit it unchanged.)",
+                )
+            ]
 
+        before = session.event_counter
+        output = await session.send_command(balanced, timeout)
+        if not acl2_output_failed(output) and session.event_counter > before:
+            session.record_accepted(balanced, session.event_counter)
+
+        note = parinfer_unavailable_note(use_parinfer)
+        if balanced != code:
+            note += "[parinfer adjusted the code]\n\n"
         return [
             TextContent(
                 type="text",
-                text=f"Retry proof result:\n\n{output}",
+                text=f"Retry proof result:\n\n{note}{output}",
             )
         ]
 
@@ -2087,13 +2299,16 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             ]
 
         if session is not None:
+            before = session.event_counter
             output = await session.send_command(balanced, timeout)
-            if not acl2_output_failed(output):
-                session.record_accepted(balanced)
+            if not acl2_output_failed(output) and session.event_counter > before:
+                session.record_accepted(balanced, session.event_counter)
         else:
             output = await run_acl2(balanced, timeout)
 
-        note = "[parinfer adjusted the code]\n\n" if balanced != code else ""
+        note = parinfer_unavailable_note(use_parinfer)
+        if balanced != code:
+            note += "[parinfer adjusted the code]\n\n"
         return [
             TextContent(
                 type="text",
@@ -2138,13 +2353,16 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             ]
 
         if session is not None:
+            before = session.event_counter
             output = await session.send_command(balanced, timeout)
-            if not acl2_output_failed(output):
-                session.record_accepted(balanced)
+            if not acl2_output_failed(output) and session.event_counter > before:
+                session.record_accepted(balanced, session.event_counter)
         else:
             output = await run_acl2(balanced, timeout)
 
-        note = "[parinfer adjusted the code]\n\n" if balanced != code else ""
+        note = parinfer_unavailable_note(use_parinfer)
+        if balanced != code:
+            note += "[parinfer adjusted the code]\n\n"
         return [
             TextContent(
                 type="text",
@@ -2155,6 +2373,9 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
     elif name == "check_syntax":
         use_parinfer = arguments.get("parinfer", True)
         return_source = bool(arguments.get("return_source", False))
+        timeout = validate_timeout(
+            arguments.get("timeout", DEFAULT_CHECK_SYNTAX_TIMEOUT)
+        )
 
         # Input is either inline code or a file; output is optional.
         try:
@@ -2191,16 +2412,12 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        # For syntax checking, we can try to parse without executing
-        # ACL2 doesn't have a dedicated syntax checker, so we'll just
-        # try to load it with a very short timeout
-        output = await run_acl2(balanced, timeout=5)
+        output = await run_acl2(balanced, timeout=timeout)
 
-        # Check for actual SYNTAX error patterns (not runtime/semantic errors)
-        # - "end of file" means unbalanced parens
-        # - "unmatched close parenthesis" is obvious
-        # - "Read error" indicates parsing failed
-        # - "READER-ERROR" is a Common Lisp read error
+        # ACL2 has no read-only syntax checker, so this runs the code for a
+        # bounded time.  Only reader/parser errors are syntax errors; admission
+        # failures, aborts, and timeouts are reported as separate outcomes so
+        # "No syntax errors detected" is not mistaken for a green light.
         syntax_error_patterns = [
             "end of file on",
             "unmatched close parenthesis",
@@ -2213,15 +2430,54 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 
         output_lower = output.lower()
         is_syntax_error = any(pattern in output_lower for pattern in syntax_error_patterns)
+        source_note = f" in {input_abs}" if input_abs is not None else ""
 
         if is_syntax_error:
-            source_note = f" in {input_abs}" if input_abs is not None else ""
             return [
                 TextContent(
                     type="text",
                     text=f"Syntax errors found{source_note}:\n\n{output}",
                 )
             ]
+
+        if output.startswith("Error: Could not start ACL2"):
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Syntax check could not run: {output}",
+                )
+            ]
+
+        if output.startswith("Error: ACL2 execution timed out"):
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Syntax check timed out after {timeout} seconds; no conclusion "
+                        "was reached and no file was written. Increase the timeout or "
+                        "check a smaller fragment."
+                    ),
+                )
+            ]
+
+        notes = parinfer_unavailable_note(bool(use_parinfer))
+        if balanced != code:
+            notes += "[parinfer adjusted the code]\n\n"
+
+        execution_failed = acl2_output_failed(output)
+        if execution_failed:
+            status = (
+                f"No syntax errors detected{source_note}, but ACL2 reported errors "
+                "while executing the balanced source. Review the output before "
+                "relying on the code; use admit/prove for acceptance.\n\n"
+            )
+        elif not output.strip():
+            status = (
+                f"Syntax check was inconclusive{source_note}: ACL2 produced no "
+                "output.\n\n"
+            )
+        else:
+            status = f"No syntax errors detected{source_note}.\n\n"
 
         if destination is not None:
             try:
@@ -2236,7 +2492,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             return [
                 TextContent(
                     type="text",
-                    text=confirmation,
+                    text=confirmation + notes + (status if execution_failed else ""),
                 )
             ]
 
@@ -2248,11 +2504,10 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        source_note = f" in {input_abs}" if input_abs is not None else ""
         return [
             TextContent(
                 type="text",
-                text=f"No syntax errors detected{source_note}.\n\n" + output,
+                text=notes + status + output,
             )
         ]
 
@@ -2273,13 +2528,31 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         file_path = arguments["file_path"]
         additional_code = arguments.get("code", "")
         timeout = arguments.get("timeout", 60)
+        use_parinfer = bool(arguments.get("parinfer", True))
 
-        output = await include_acl2_book(file_path, additional_code, timeout)
+        balanced, parinfer_error = await balance_if_enabled(
+            additional_code, use_parinfer, DEFAULT_PARINFER_MODE
+        )
+        if parinfer_error:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: parinfer could not balance the code: {parinfer_error}\n"
+                    "(Use parinfer=false to submit it unchanged.)",
+                )
+            ]
 
+        output = await include_acl2_book(file_path, balanced, timeout)
+
+        note = parinfer_unavailable_note(
+            use_parinfer and bool(additional_code.strip())
+        )
+        if balanced != additional_code:
+            note += "[parinfer adjusted the code]\n\n"
         return [
             TextContent(
                 type="text",
-                text=output,
+                text=note + output,
             )
         ]
 
@@ -2398,20 +2671,42 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
+        rolled_back = False
         if session is not None:
+            before = session.event_counter
             output = await session.send_command(balanced, timeout)
+            success = not acl2_output_failed(output)
+
+            # admit is a test: undo any events the submission managed to add,
+            # whether it succeeded or failed part-way through.
+            if session.is_alive() and session.event_counter > before:
+                undo_output = await session.send_command(f":ubt {before + 1}", timeout)
+                if acl2_output_failed(undo_output):
+                    return [
+                        TextContent(
+                            type="text",
+                            text=(
+                                "Error: Admit ran but the test event(s) could not be "
+                                f"rolled back:\n\n{undo_output}"
+                            ),
+                        )
+                    ]
+                rolled_back = True
         else:
             output = await run_acl2(balanced, timeout)
+            success = not acl2_output_failed(output)
 
-        success = not acl2_output_failed(output)
-        if success and session is not None:
-            session.record_accepted(balanced)
-
-        note = "[parinfer adjusted the code]\n\n" if balanced != code else ""
+        note = parinfer_unavailable_note(use_parinfer)
+        if balanced != code:
+            note += "[parinfer adjusted the code]\n\n"
+        rollback_note = " (test event(s) rolled back)" if rolled_back else ""
         return [
             TextContent(
                 type="text",
-                text=f"{note}Admit {'succeeded' if success else 'failed'}:\n\n{output}",
+                text=(
+                    f"{note}Admit {'succeeded' if success else 'failed'}"
+                    f"{rollback_note}:\n\n{output}"
+                ),
             )
         ]
 
@@ -2538,7 +2833,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        source = "\n\n".join(form.rstrip() for form in session.accepted_code) + "\n"
+        source = "\n\n".join(form.code.rstrip() for form in session.accepted_code) + "\n"
 
         if file_path:
             try:
@@ -2594,7 +2889,37 @@ async def handle_call_tool(_ctx: Any, params: Any) -> CallToolResult:
             content=[TextContent(type="text", text=f"Error: {e}")],
             is_error=True,
         )
-    return CallToolResult(content=list(content))
+    except KeyError as e:
+        # The low-level server does not validate inputSchema itself; a client
+        # that omits a required field reaches the handler as a KeyError.
+        return CallToolResult(
+            content=[
+                TextContent(
+                    type="text",
+                    text=f"Error: Missing required argument: {e.args[0]!s}",
+                )
+            ],
+            is_error=True,
+        )
+    except Exception:
+        logger.exception("Unhandled error in tool %s", params.name)
+        return CallToolResult(
+            content=[
+                TextContent(
+                    type="text",
+                    text="Error: Internal server error while executing the tool.",
+                )
+            ],
+            is_error=True,
+        )
+    # Tool handlers report validation and execution failures as text.  Mirror
+    # that in isError so MCP clients can react without string matching.
+    is_error = any(
+        block.text.startswith(("Error:", "Syntax errors found"))
+        for block in content
+        if isinstance(block, TextContent)
+    )
+    return CallToolResult(content=list(content), is_error=is_error)
 
 
 # Global server instance. Handlers are registered through the constructor, the

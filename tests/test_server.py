@@ -7,6 +7,8 @@ import pytest
 
 from acl2_mcp.server import run_acl2, call_tool
 
+pytestmark = pytest.mark.acl2
+
 
 @pytest.mark.asyncio
 async def test_run_acl2_simple_expression() -> None:
@@ -16,8 +18,8 @@ async def test_run_acl2_simple_expression() -> None:
 
     assert result is not None
     assert isinstance(result, str)
-    # ACL2 should evaluate this expression
-    assert "3" in result or "ACL2" in result
+    # The banner and prompts are stripped; the value is all that remains.
+    assert result.strip() == "3"
 
 
 @pytest.mark.asyncio
@@ -31,8 +33,8 @@ async def test_run_acl2_definition() -> None:
 
     assert result is not None
     assert isinstance(result, str)
-    # Should see function acceptance or ACL2 prompt
-    assert "MY-ADD" in result.upper() or "ACL2" in result
+    assert "MY-ADD" in result.upper()
+    assert "Welcome to" not in result
 
 
 @pytest.mark.asyncio
@@ -42,8 +44,7 @@ async def test_run_acl2_syntax_error() -> None:
     result = await run_acl2(code, timeout=10)
 
     assert result is not None
-    # ACL2 should report some kind of error or incomplete input
-    assert len(result) > 0
+    assert "end of file" in result.lower() or "error" in result.lower()
 
 
 @pytest.mark.asyncio
@@ -62,7 +63,7 @@ async def test_call_tool_prove() -> None:
 
     assert len(result) == 1
     assert result[0].type == "text"
-    assert len(result[0].text) > 0
+    assert "Q.E.D." in result[0].text
 
 
 @pytest.mark.asyncio
@@ -77,7 +78,7 @@ async def test_call_tool_evaluate() -> None:
 
     assert len(result) == 1
     assert result[0].type == "text"
-    assert "12" in result[0].text or "ACL2" in result[0].text
+    assert "12" in result[0].text
 
 
 @pytest.mark.asyncio
@@ -97,7 +98,8 @@ async def test_call_tool_evaluate_with_definition() -> None:
 
     assert len(result) == 1
     assert result[0].type == "text"
-    assert len(result[0].text) > 0
+    assert "SQUARE" in result[0].text.upper()
+    assert "16" in result[0].text
 
 
 @pytest.mark.asyncio
@@ -114,8 +116,8 @@ async def test_call_tool_check_syntax_valid() -> None:
 
     assert len(result) == 1
     assert result[0].type == "text"
-    # Should not report syntax errors
-    assert "No obvious syntax errors" in result[0].text or "ACL2" in result[0].text
+    assert "No syntax errors detected" in result[0].text
+    assert "reported errors" not in result[0].text
 
 
 @pytest.mark.asyncio
@@ -129,8 +131,7 @@ async def test_call_tool_check_syntax_invalid() -> None:
 
     assert len(result) == 1
     assert result[0].type == "text"
-    # Will either report syntax errors or just show ACL2 waiting for input
-    assert "Syntax errors found" in result[0].text or "ACL2" in result[0].text
+    assert "Syntax errors found" in result[0].text
 
 
 @pytest.mark.asyncio

@@ -35,27 +35,50 @@ This is an MCP (Model Context Protocol) server that provides tools for interacti
 
 Sessions use a marker-based protocol to detect command completion:
 - Commands sent via stdin
-- Cryptographically random marker sent after each command: `___MARKER_{uuid}_{uuid}___`
-- Reads stdout until marker appears or timeout
-- True total timeout (not per-line) prevents DoS
+- Cryptographically random marker sent after each command: `__M_{uuid}__`
+- The marker form also reports ACL2's relative command number, which drives
+  event counts and backtracking
+- Reads stdout until the marker appears or the total timeout expires
+- After the marker, the probe's own `NIL` return value and prompt are consumed
+  so they do not leak into the next result
+- A command timeout kills the ACL2 process (`terminate_after_timeout`).  This is
+  deliberate: leaving the reader inside an incomplete form would make every
+  subsequent command hang
+- A background task drains stderr into a bounded deque so a full pipe cannot
+  block ACL2
+
+### Output Cleaning
+
+`clean_acl2_output` removes the startup banner and `ACL2 !>` prompts from
+results.  `ACL2_MCP_RAW_OUTPUT=1` keeps the raw transcript for debugging.
 
 ### Security Features
 
 Security validation is extensive (see `SECURITY.md`):
 - Input validation: code length (1MB max), timeout (1-300s), file paths, identifiers
-- Path traversal prevention: all paths resolved to absolute
+- Identifier validation accepts only plain ACL2 symbols (letters, digits, and
+  the usual symbol punctuation); whitespace, newlines, quotes, parens, and `;`
+  are rejected
 - Command injection prevention: ACL2 strings escaped, identifiers validated
 - DoS prevention: session limits, timeout enforcement, checkpoint limits
-- No internal error details leaked to clients
+- Missing ACL2 executables and missing required arguments are reported as tool
+  errors (`isError`) instead of uncaught Python exceptions
+- Unexpected internal exceptions are logged and returned generically
 
 ## Development Commands
 
 ### Setup
 ```bash
-# Create virtual environment and install
+# Create virtual environment and install (dev extras include pytest + mypy)
 python3 -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -e .
+pip install -e '.[dev]'
+
+# ACL2 is configured through the environment, not a hardcoded PATH lookup
+export ACL2=/path/to/acl2/saved_acl2
+export ACL2_SYSTEM_BOOKS=/path/to/acl2/books
+# Optional: parinfer-rust shared library (default /usr/local/lib/libparinfer_rust.so)
+export PARINFER_LIB=/usr/local/lib/libparinfer_rust.so
 ```
 
 ### Running the Server
@@ -69,7 +92,7 @@ python -m acl2_mcp.server
 
 ### Testing
 ```bash
-# Run all tests
+# Run all tests (ACL2-dependent tests skip if ACL2 is not configured)
 pytest
 
 # Run specific test file
@@ -79,23 +102,32 @@ python -m pytest tests/test_server.py -v
 python -m pytest tests/ -v --tb=short
 ```
 
+Tests that need a real ACL2 carry the `acl2` marker (see `tests/conftest.py`);
+without `ACL2` (or `acl2` on PATH) they skip rather than fail.
+
 ### Type Checking
 ```bash
-# Type check with mypy (strict mode enabled)
+# Strict mode is configured in pyproject.toml; this should report no issues
 python -m mypy acl2_mcp/
 ```
 
 ## Testing Architecture
 
 Test organization:
+- **[tests/conftest.py](tests/conftest.py)**: `acl2` marker and skip logic for machines without ACL2
 - **[tests/test_server.py](tests/test_server.py)**: Core functionality tests (tools, ACL2 execution)
-- **[tests/test_security.py](tests/test_security.py)**: Security validation tests
+- **[tests/test_security.py](tests/test_security.py)**: Validation, injection, launch-error, and tool-error tests
 - **[tests/test_sessions.py](tests/test_sessions.py)**: Session management tests
+- **[tests/test_backtracking.py](tests/test_backtracking.py)**: Undo/checkpoint/theorem/book regression tests
 - **[tests/test_parinfer.py](tests/test_parinfer.py)**: In-process parinfer balancing and session integration
-- **[tests/test_export.py](tests/test_export.py)**: Accepted-source export (text and file modes)
+- **[tests/test_export.py](tests/test_export.py)**: Accepted-event export (text and file modes)
+- **[tests/test_file_input.py](tests/test_file_input.py)**: `input_path`/`output_path`/`in_place` across tools
 - **[tests/test_syntax.py](tests/test_syntax.py)**: Parinfer-aware check_syntax source/file output
+- **[tests/test_regressions.py](tests/test_regressions.py)**: Admit rollback, export pruning, retry balancing, syntax status, timeout termination
+- **[tests/test_protocol.py](tests/test_protocol.py)**: Real MCP client negotiation and `isError` behavior
 
-All tests use `pytest-asyncio` for async testing.
+All async tests use `pytest-asyncio`; the fixture loop scope is configured in
+`pyproject.toml`.
 
 ## Tool Implementation Pattern
 
@@ -103,7 +135,8 @@ When adding/modifying tools:
 
 1. Add tool definition to `list_tools()` with:
    - Clear description (optimized for AI understanding)
-   - Complete `inputSchema` with types and descriptions
+   - Complete `input_schema` with types and descriptions (the MCP 2.x
+     Python field name; it serializes to `inputSchema` on the wire)
    - Required fields marked in schema
 
 2. Add handler in `call_tool()`:
@@ -117,12 +150,42 @@ When adding/modifying tools:
    - Send command: `await session.send_command(code, timeout)`
    - Session lock already handled by `send_command()`
 
+## Semantics Worth Preserving
+
+- **admit** is a test, not a write: in a session it records the event count
+  before and after, then `:ubt`s any added events. It does not call
+  `record_accepted`.
+- **export_session_code** tracks accepted *events* (`AcceptedForm` carries the
+  event number). `send_command` prunes entries above the new event count on
+  undo/restore/raw `:ubt`; bare evaluations are not recorded.
+- **retry_proof** balances with parinfer and records successful events, like
+  `prove`.
+- **check_syntax** classifies reader errors separately from admission failures,
+  aborts, and timeouts, and does not write output on reader errors or timeouts.
+- **Session timeout** terminates the process (`terminate_after_timeout`); do not
+  change this back to returning a timeout while leaving the reader blocked.
+
 ## Key Constraints
 
-- **ACL2 dependency**: Server requires ACL2 in PATH (exits gracefully if missing)
+- **ACL2 dependency**: The executable comes from `ACL2`, falling back to `acl2`
+  on PATH. A missing executable produces a clear tool error; it does not shut
+  the server down. `ACL2_SYSTEM_BOOKS` locates system books.
+- **Parinfer dependency**: Default balancing needs the parinfer-rust shared
+  library (`PARINFER_LIB`, default `/usr/local/lib/libparinfer_rust.so`). If it
+  is unavailable, code tools submit unchanged and prepend a warning; the
+  `parinfer` tool errors.
 - **Python 3.10+**: Uses modern type hints (including `dict[str, X]` syntax)
-- **Strict typing**: `mypy --strict` enforced in CI/development
+- **Strict typing**: `mypy --strict` is configured in `pyproject.toml`; run it
+  manually (there is no CI workflow in this repository yet)
 - **File path conventions**:
-  - Books: WITHOUT `.lisp` extension (certify_book, include_book)
-  - Regular files: WITH `.lisp` extension (check_theorem, query_event)
+  - Books: normally WITHOUT `.lisp` (certify_book, include_book); a trailing
+    `.lisp` is accepted
+  - Regular input files: WITH `.lisp` for check_theorem, query_event, verify_guards
+  - `check_syntax`/`parinfer`: `input_path` is the input and
+    `output_path`/`file_path` is the output destination
+  - `export_session_code`: `file_path` is the output destination
+- **Code tools**: `code` and `input_path` are mutually exclusive and exactly one
+  is required (prove, evaluate, check_syntax, admit, retry_proof, parinfer)
+- **Timeouts**: clamped to 1–300 seconds; a session timeout terminates that
+  session
 - **Async throughout**: All I/O operations use asyncio

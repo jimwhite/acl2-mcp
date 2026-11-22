@@ -17,7 +17,7 @@ needs_parinfer = pytest.mark.skipif(
     not parinfer_available(), reason="parinfer shared library is not available"
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.acl2]
 
 
 def text(result: list[Any]) -> str:

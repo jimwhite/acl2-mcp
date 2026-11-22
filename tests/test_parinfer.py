@@ -51,6 +51,7 @@ async def test_parinfer_ignores_quotes_in_line_comments() -> None:
     assert not output.startswith("Error:")
 
 
+@pytest.mark.acl2
 @pytest.mark.asyncio
 async def test_session_auto_balances_and_exports_balanced_source() -> None:
     """Sessions balance by default and export the code ACL2 actually got."""
@@ -73,6 +74,7 @@ async def test_session_auto_balances_and_exports_balanced_source() -> None:
         await call_tool("end_session", {"session_id": session_id})
 
 
+@pytest.mark.acl2
 @pytest.mark.asyncio
 async def test_per_call_parinfer_false_skips_balancing() -> None:
     """parinfer=false submits the code unchanged, so the extra paren fails."""
@@ -97,6 +99,7 @@ async def test_per_call_parinfer_false_skips_balancing() -> None:
         await call_tool("end_session", {"session_id": session_id})
 
 
+@pytest.mark.acl2
 @pytest.mark.asyncio
 async def test_session_parinfer_false_skips_balancing() -> None:
     """A session can disable parinfer for all its submissions."""

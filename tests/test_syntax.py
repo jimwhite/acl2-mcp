@@ -7,6 +7,8 @@ import pytest
 
 from acl2_mcp.server import call_tool
 
+pytestmark = pytest.mark.acl2
+
 
 def text(result: list[Any]) -> str:
     return "".join(block.text for block in result)

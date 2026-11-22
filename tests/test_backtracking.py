@@ -14,7 +14,7 @@ import pytest
 
 from acl2_mcp.server import call_tool, session_manager
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.acl2]
 
 
 async def _start(name: str) -> str:

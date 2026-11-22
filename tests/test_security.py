@@ -1,6 +1,7 @@
 """Security tests for ACL2 MCP server."""
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -11,6 +12,7 @@ from acl2_mcp.server import (
     escape_acl2_string,
     validate_file_path,
     call_tool,
+    handle_call_tool,
 )
 
 
@@ -51,6 +53,13 @@ def test_validate_acl2_identifier_rejects_empty() -> None:
     """Test that empty identifiers are rejected."""
     with pytest.raises(ValueError, match="cannot be empty"):
         validate_acl2_identifier("")
+
+
+def test_validate_acl2_identifier_rejects_whitespace_and_semicolons() -> None:
+    """Names cannot break out of the surrounding form via newline/comment."""
+    for bad in ("append\n:pe car", "append\r:pe car", "append; comment", "a b"):
+        with pytest.raises(ValueError, match="Invalid ACL2 identifier"):
+            validate_acl2_identifier(bad)
 
 
 def test_validate_acl2_identifier_accepts_valid() -> None:
@@ -112,6 +121,46 @@ async def test_code_length_limit() -> None:
 
     assert len(result) == 1
     assert "exceeds maximum length" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_missing_acl2_executable_is_a_tool_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing ACL2 binary returns a clear error, not a traceback."""
+    monkeypatch.setenv("ACL2", "/nonexistent-acl2")
+
+    result = await call_tool("evaluate", {"code": "(+ 1 2)"})
+
+    assert len(result) == 1
+    assert "Could not start ACL2 executable" in result[0].text
+    assert "ACL2 environment variable" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_start_session_missing_acl2_is_a_tool_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Starting a session with a bad ACL2 path reports the executable."""
+    monkeypatch.setenv("ACL2", "/nonexistent-acl2")
+
+    result = await call_tool("start_session", {"name": "missing-acl2"})
+
+    assert len(result) == 1
+    assert "Could not start ACL2 executable" in result[0].text
+
+
+@pytest.mark.asyncio
+async def test_missing_required_argument_is_a_tool_error() -> None:
+    """Omitting a required argument surfaces as isError, not a KeyError."""
+    result = await handle_call_tool(
+        None, SimpleNamespace(name="undo", arguments={})
+    )
+
+    assert result.is_error
+    output = "".join(block.text for block in result.content)
+    assert "Missing required argument" in output
+    assert "session_id" in output
 
 
 @pytest.mark.asyncio
