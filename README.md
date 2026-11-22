@@ -87,9 +87,12 @@ The server picks a kernelspec from the environment (an explicit override wins, t
 
 ### Install a kernelspec
 
-From the `acl2-jupyter-kernel` checkout:
+The kernel is linked as the submodule `external/acl2-jupyter-kernel`. From
+there:
 
 ```bash
+cd external/acl2-jupyter-kernel
+
 # For the ACL2 image you use (CCL example: /workspaces/acl2/saved_acl2)
 ACL2=/workspaces/acl2/saved_acl2 \
 ACL2_HOME=/workspaces/acl2 \
@@ -116,6 +119,9 @@ Remember that a books tree is certified for one Lisp implementation. Do not poin
 # Clone the repository
 cd acl2-mcp
 
+# Get the linked repository dependencies (ACL2 Jupyter kernel, parinfer-rust)
+git submodule update --init --recursive
+
 # Create and activate virtual environment
 python3 -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
@@ -123,6 +129,19 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 # Install the package plus test/type-check tooling
 pip install -e '.[dev]'
 ```
+
+### Linked repositories
+
+`git submodule update --init --recursive` provides:
+
+| Path | Purpose |
+| --- | --- |
+| `external/acl2-jupyter-kernel` | The ACL2 Jupyter kernel used for all execution; install its kernelspec as described above. |
+| `external/parinfer-rust` | Source for `libparinfer_rust.so` (optional). Build with `cargo build --release`; install the library or point `PARINFER_LIB` at it. |
+
+The superproject records the pinned commit for each submodule. To move a pin,
+check out the desired commit inside the submodule and commit the updated
+gitlink in `acl2-mcp`.
 
 ### Running the tests
 

@@ -1,0 +1,6 @@
+[submodule "external/acl2-jupyter-kernel"]
+	path = external/acl2-jupyter-kernel
+	url = https://github.com/jimwhite/acl2-jupyter-kernel.git
+[submodule "external/parinfer-rust"]
+	path = external/parinfer-rust
+	url = https://github.com/jimwhite/parinfer-rust.git
