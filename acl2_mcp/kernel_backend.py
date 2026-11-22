@@ -203,6 +203,18 @@ class KernelClient:
     ) -> None:
         _validate_acl2_environment()
         self.kernel_name = kernel_name or resolve_kernel_name()
+        explicit_kernel = os.environ.get("ACL2_MCP_KERNEL") or os.environ.get(
+            "ACL2_MCP_KERNEL_NAME"
+        )
+        if kernel_name is None and not explicit_kernel:
+            # A pip install bundles the kernel sources; install the kernelspec
+            # for the configured ACL2 image on first use.
+            from .provision import ProvisionError, ensure_kernelspec
+
+            try:
+                ensure_kernelspec(self.kernel_name)
+            except ProvisionError as exc:
+                raise KernelConfigError(str(exc)) from exc
         spec_env = _kernel_spec_env(self.kernel_name)
         merged_env = kernel_environment(spec_env)
         if env:
@@ -223,6 +235,15 @@ class KernelClient:
             os.environ.get("ACL2_MCP_KERNEL_LOG_DIR", "/tmp"),
             f"acl2-mcp-kernel-{self.kernel_name}.log",
         )
+        # Keep the log from growing without bound across many kernels.
+        try:
+            max_bytes = int(
+                os.environ.get("ACL2_MCP_KERNEL_LOG_MAX_BYTES", "10000000")
+            )
+            if os.path.getsize(log_path) > max(0, max_bytes):
+                os.replace(log_path, log_path + ".1")
+        except (OSError, ValueError):
+            pass
         try:
             # A kernel launched with inherited stdout/stderr would write ACL2's
             # startup banner over the MCP server's stdio transport.  Send the
@@ -356,7 +377,11 @@ class KernelClient:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise KernelTimeout("Timed out waiting for a completeness reply")
+                    self._shutdown_unlocked()
+                    raise KernelTimeout(
+                        "Timed out waiting for a completeness reply; the kernel "
+                        "was stopped."
+                    )
                 try:
                     reply = self.kc.get_shell_msg(timeout=min(0.5, remaining))
                 except queue.Empty:
@@ -399,7 +424,11 @@ class KernelClient:
         except Exception:
             pass
         try:
-            self.km.shutdown_kernel(now=True)
+            # Avoid asking jupyter_client to stop a process that is already
+            # gone; its async wrapper leaves an un-awaited coroutine behind
+            # when the kernel has died.
+            if self.km.is_alive():
+                self.km.shutdown_kernel(now=True)
         except Exception:
             pass
 

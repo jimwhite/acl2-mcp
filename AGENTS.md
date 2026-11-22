@@ -37,6 +37,14 @@ This is an MCP (Model Context Protocol) server that provides tools for interacti
   - ACL2 execution functions (`run_acl2()`, `run_acl2_file()`)
   - Session management (`SessionManager`, `ACL2Session`)
   - Security validation functions (timeout, file path, identifiers, etc.)
+- **[acl2_mcp/kernel_backend.py](acl2_mcp/kernel_backend.py)**: Jupyter
+  transport, kernel selection, and per-kernel logging.
+- **[acl2_mcp/provision.py](acl2_mcp/provision.py)**: Builds/locates the
+  parinfer library and installs the ACL2 Jupyter kernelspec on first use; also
+  the `acl2-mcp-install` entry point.
+- **[setup.py](setup.py)**: `build_py` hook that stages the bundled kernel
+  sources and builds parinfer. **[MANIFEST.in](MANIFEST.in)** ships the
+  submodule sources in the sdist.
 
 ### Execution Modes
 
@@ -68,7 +76,8 @@ This is an MCP (Model Context Protocol) server that provides tools for interacti
   form would desynchronize every later command.
 - The kernel child's stdout/stderr are redirected to
   `/tmp/acl2-mcp-kernel-<kernel>.log` (`ACL2_MCP_KERNEL_LOG_DIR`) so ACL2 output
-  cannot corrupt the MCP stdio transport.
+  cannot corrupt the MCP stdio transport. The log rotates to `.1` above
+  `ACL2_MCP_KERNEL_LOG_MAX_BYTES` (default 10 MB).
 
 ### Output Cleaning
 
@@ -100,9 +109,14 @@ pip install -e '.[dev]'
 # ACL2 is configured through the environment, not a hardcoded PATH lookup
 export ACL2=/path/to/acl2/saved_acl2
 export ACL2_SYSTEM_BOOKS=/path/to/acl2/books
-# Optional: parinfer-rust shared library (default /usr/local/lib/libparinfer_rust.so)
-export PARINFER_LIB=/usr/local/lib/libparinfer_rust.so
+# Optional: force a parinfer library instead of the one built by setup.py
+# export PARINFER_LIB=/path/to/libparinfer_rust.so
 ```
+
+`pip install` builds `external/parinfer-rust` into `acl2_mcp/_lib` and bundles
+`external/acl2-jupyter-kernel` into `acl2_mcp/_kernel`; on first use the server
+installs the kernelspec from that bundle (`acl2-mcp-install` does it
+explicitly). Set `ACL2_MCP_SKIP_PARINFER_BUILD=1` to skip the Rust build.
 
 ### Running the Server
 ```bash
@@ -137,7 +151,8 @@ python -m mypy acl2_mcp/
 ## Testing Architecture
 
 Test organization:
-- **[tests/conftest.py](tests/conftest.py)**: `acl2` marker and skip logic for machines without ACL2
+- **[tests/conftest.py](tests/conftest.py)**: `acl2` marker, skip logic, and kernelspec provisioning
+- **[tests/test_provision.py](tests/test_provision.py)**: Parinfer lookup/build and end-to-end kernelspec provisioning
 - **[tests/test_server.py](tests/test_server.py)**: Core functionality tests (tools, ACL2 execution)
 - **[tests/test_security.py](tests/test_security.py)**: Validation, injection, launch-error, and tool-error tests
 - **[tests/test_sessions.py](tests/test_sessions.py)**: Session management tests
@@ -180,9 +195,21 @@ When adding/modifying tools:
   `record_accepted`.
 - **export_session_code** tracks accepted *events* (`AcceptedForm` carries the
   event number). `send_command` prunes entries above the new event count on
-  undo/restore/raw `:ubt`; bare evaluations are not recorded.
+  undo/restore/raw `:ubt`; bare evaluations are not recorded. When a
+  multi-form submission adds events and also reports an ACL2 error (ACL2
+  continues past a failed event), `accepted_submission_source` records the
+  forms the kernel reported as accepted instead of dropping the submission.
+  include-book expansions are recorded only when the whole submission
+  succeeded.
+- **include_book** is session-aware: with `session_id` it loads into that
+  session's world (and records the load for export); without one it uses a
+  throwaway kernel.
 - **retry_proof** balances with parinfer and records successful events, like
   `prove`.
+- **acl2_output_failed** matches full ACL2 error headers ("ACL2 Error in ...",
+  "ACL2 Error [Failure] in ...", "ACL2 Error: ...") rather than the bare
+  string, so user output such as `(cw "ACL2 Error")` does not turn a
+  successful call into `isError`.
 - **query_event** and **verify_guards** accept either a one-off world
   (optionally seeded with `file_path`) or a session's current world
   (`session_id`); the two sources are mutually exclusive. A successful session
@@ -191,6 +218,9 @@ When adding/modifying tools:
   missing name, and starts its result with an explicit re-proof summary.
 - **check_syntax** classifies reader errors separately from admission failures,
   aborts, and timeouts, and does not write output on reader errors or timeouts.
+  With `session_id`, readable code is executed in the session's context and any
+  events it adds are rolled back (like `admit`); without one it uses a
+  throwaway kernel.
 - **Session timeout** shuts down the kernel
   (`KernelClient._shutdown_unlocked`) and marks the session dead; do not change
   this back to returning a timeout while leaving the kernel running.
@@ -200,10 +230,18 @@ When adding/modifying tools:
 - **ACL2 dependency**: The executable comes from `ACL2`, falling back to `acl2`
   on PATH. A missing executable produces a clear tool error; it does not shut
   the server down. `ACL2_SYSTEM_BOOKS` locates system books.
-- **Parinfer dependency**: Default balancing needs the parinfer-rust shared
-  library (`PARINFER_LIB`, default `/usr/local/lib/libparinfer_rust.so`). If it
-  is unavailable, code tools submit unchanged and prepend a warning; the
-  `parinfer` tool errors.
+- **Provisioning** (`acl2_mcp/provision.py`): `setup.py`'s `build_py` hook
+  builds `external/parinfer-rust` into `acl2_mcp/_lib` and stages
+  `external/acl2-jupyter-kernel` into `acl2_mcp/_kernel`. On first use the
+  server (and `acl2-mcp-install`) installs a missing kernelspec from the
+  bundled sources via the ACL2 image and patches the spec's startup argv to
+  put the bundled kernel directory on `asdf:*central-registry*`. Wheels are
+  platform-tagged because they contain the native library.
+- **Parinfer dependency**: Balancing needs the parinfer-rust shared library.
+  Lookup order is `PARINFER_LIB`, the packaged `acl2_mcp/_lib`, the source
+  build under `external/parinfer-rust/target/release`, then the legacy
+  `/usr/local/lib/libparinfer_rust.so`. If it is unavailable, code tools
+  submit unchanged and prepend a warning; the `parinfer` tool errors.
 - **Python 3.10+**: Uses modern type hints (including `dict[str, X]` syntax)
 - **Strict typing**: `mypy --strict` is configured in `pyproject.toml`; run it
   manually (there is no CI workflow in this repository yet)
@@ -215,7 +253,8 @@ When adding/modifying tools:
     `output_path`/`file_path` is the output destination
   - `export_session_code`: `file_path` is the output destination
 - **Code tools**: `code` and `input_path` are mutually exclusive and exactly one
-  is required (prove, evaluate, check_syntax, admit, retry_proof, parinfer)
+  is required (prove, evaluate, check_syntax, admit, retry_proof, parinfer).
+  `check_syntax` and `include_book` also accept `session_id`.
 - **Timeouts**: clamped to 1–300 seconds; a session timeout terminates that
   session
 - **Async throughout**: All I/O operations use asyncio

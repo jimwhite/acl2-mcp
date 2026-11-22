@@ -142,3 +142,29 @@ async def test_export_rejects_missing_parent(tmp_path: Path) -> None:
         assert result.startswith("Error: Parent directory does not exist")
     finally:
         await call_tool("end_session", {"session_id": session_id})
+
+
+@pytest.mark.asyncio
+async def test_export_records_accepted_forms_from_partial_submission() -> None:
+    """ACL2 keeps reading after a failed event; the accepted forms are exported."""
+    session_id = await start_session()
+    try:
+        await call_tool(
+            "evaluate",
+            {
+                "code": (
+                    "(defun partial-kept (x) (cons x x))\n"
+                    "(defthm partial-impossible (equal 1 2))"
+                ),
+                "session_id": session_id,
+            },
+        )
+
+        exported = text(
+            await call_tool("export_session_code", {"session_id": session_id})
+        )
+
+        assert "partial-kept" in exported, exported
+        assert "partial-impossible" not in exported, exported
+    finally:
+        await call_tool("end_session", {"session_id": session_id})

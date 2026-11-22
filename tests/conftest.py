@@ -2,8 +2,8 @@
 
 Tests that start a real ACL2 are marked ``acl2`` and are skipped unless both
 an ACL2 launcher (``ACL2`` or ``acl2`` on PATH) and the matching ACL2 Jupyter
-kernelspec are available.  Install a kernelspec with
-``acl2-jupyter-kernel/install-kernelspec.sh``.
+kernelspec are available.  The kernelspec is provisioned from the bundled
+kernel sources when it is missing (the server does the same on first use).
 """
 
 import os
@@ -30,8 +30,15 @@ def _kernel_available() -> bool:
         from jupyter_client.kernelspec import KernelSpecManager
     except Exception:
         return False
+    name = resolve_kernel_name()
     try:
-        KernelSpecManager().get_kernel_spec(resolve_kernel_name())
+        from acl2_mcp.provision import ensure_kernelspec
+
+        ensure_kernelspec(name)
+    except Exception:
+        return False
+    try:
+        KernelSpecManager().get_kernel_spec(name)
         return True
     except Exception:
         return False

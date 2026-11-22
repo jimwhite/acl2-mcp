@@ -128,6 +128,21 @@ async def test_check_syntax_timeout_is_reported(monkeypatch: pytest.MonkeyPatch)
     assert "No syntax errors detected" not in result
 
 
+async def test_check_syntax_return_source_reports_execution_failure() -> None:
+    """return_source is for successful checks; failures must not be hidden."""
+    result = text(
+        await call_tool(
+            "check_syntax",
+            {
+                "code": "(defthm return-source-impossible (equal 1 2))",
+                "return_source": True,
+            },
+        )
+    )
+    assert "ACL2 reported errors" in result, result
+    assert "ACL2 Error" in result or "FAILED" in result, result
+
+
 async def test_session_timeout_terminates_session() -> None:
     """A timed-out command kills the process instead of desynchronizing it."""
     session_id = await start_session()

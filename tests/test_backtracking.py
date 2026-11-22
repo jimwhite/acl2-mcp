@@ -244,7 +244,7 @@ async def test_dead_session_is_reaped() -> None:
     session = session_manager.get_session(session_id)
     assert session is not None
 
-    session.kernel.km.shutdown_kernel(now=True)
+    await asyncio.to_thread(session.kernel.km.shutdown_kernel, now=True)
     await asyncio.sleep(0.2)
 
     result = await call_tool(

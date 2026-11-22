@@ -224,3 +224,39 @@ async def test_in_place_conflicts_with_output(tmp_path: Path) -> None:
         )
     )
     assert "in_place cannot be combined" in result, result
+
+
+async def test_certify_book_accepts_dotted_book_name(tmp_path: Path) -> None:
+    """A dot in the book name is part of the name, not the .lisp extension."""
+    write(
+        tmp_path / "my.book.lisp",
+        '(in-package "ACL2")\n(defun dotted-book-fn (x) x)\n',
+    )
+
+    result = text(
+        await call_tool("certify_book", {"file_path": str(tmp_path / "my.book")})
+    )
+
+    assert "CERTIFICATION ATTEMPT" in result, result
+    assert "File not found" not in result, result
+    assert (tmp_path / "my.book.cert").exists(), result
+
+
+async def test_check_syntax_write_reports_execution_failure(tmp_path: Path) -> None:
+    """Writing the balanced source must not hide why execution failed."""
+    source = write(
+        tmp_path / "fails.lisp", "(defthm write-impossible (equal 1 2))\n"
+    )
+    destination = tmp_path / "written.lisp"
+
+    result = text(
+        await call_tool(
+            "check_syntax",
+            {"input_path": str(source), "output_path": str(destination)},
+        )
+    )
+
+    assert result.startswith("Wrote"), result
+    assert "ACL2 reported errors" in result, result
+    assert "ACL2 Error" in result or "FAILED" in result, result
+    assert destination.exists()

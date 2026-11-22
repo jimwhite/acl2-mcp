@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -37,12 +37,25 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 
+[tool.setuptools]
+packages = ["acl2_mcp"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+acl2_mcp = ["_kernel/*.lisp", "_kernel/*.asd", "_lib/*"]
+
 [project.scripts]
 acl2-mcp = "acl2_mcp.server:main"
+acl2-mcp-install = "acl2_mcp.provision:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    # jupyter_client 8.10 schedules a run_sync coroutine on its shutdown runner
+    # loop at interpreter exit; the coroutine can be collected un-awaited.
+    "ignore:coroutine 'KernelManager\\._async_.*' was never awaited:RuntimeWarning",
+]
 markers = [
     "acl2: test requires a working ACL2 executable (ACL2 environment variable or acl2 on PATH)",
 ]

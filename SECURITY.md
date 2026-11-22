@@ -73,7 +73,7 @@ The ACL2 MCP server executes arbitrary ACL2 code provided by the client. This is
 - Resolves to absolute paths
 - Verifies file exists
 - Verifies path is a file (not a directory)
-- Error messages only expose filename, not full path
+- Error messages include the resolved path so the caller can correct it
 
 **Current Limitations:**
 - Does not restrict access to specific directories

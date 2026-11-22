@@ -1,0 +1,15 @@
+include README.md
+include LICENSE
+include SECURITY.md
+include AGENTS.md
+
+# Sources staged into the wheel by setup.py's build_py hook.
+include external/acl2-jupyter-kernel/*.lisp
+include external/acl2-jupyter-kernel/*.asd
+recursive-include external/parinfer-rust/src *
+include external/parinfer-rust/Cargo.toml
+include external/parinfer-rust/Cargo.lock
+include external/parinfer-rust/LICENSE*
+
+prune external/*/.git
+prune external/parinfer-rust/target

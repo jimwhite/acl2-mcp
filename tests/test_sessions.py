@@ -589,7 +589,7 @@ async def test_broken_pipe_on_send_command() -> None:
     assert session is not None
 
     # Kill the ACL2 kernel process
-    session.kernel.km.shutdown_kernel(now=True)
+    await asyncio.to_thread(session.kernel.km.shutdown_kernel, now=True)
 
     # Try to send a command (should get broken pipe error)
     result = await call_tool("evaluate", {
@@ -598,8 +598,13 @@ async def test_broken_pipe_on_send_command() -> None:
     })
 
     assert len(result) == 1
-    # Should get error message about broken pipe or connection lost
-    assert "broken pipe" in result[0].text.lower() or "connection lost" in result[0].text.lower()
+    # Should get an error that the session is no longer usable
+    lowered = result[0].text.lower()
+    assert (
+        "terminated" in lowered
+        or "broken pipe" in lowered
+        or "connection lost" in lowered
+    )
 
     # Cleanup
     await call_tool("end_session", {"session_id": session_id})
@@ -616,7 +621,7 @@ async def test_broken_pipe_on_terminate() -> None:
     assert session is not None
 
     # Kill the ACL2 kernel process
-    session.kernel.km.shutdown_kernel(now=True)
+    await asyncio.to_thread(session.kernel.km.shutdown_kernel, now=True)
 
     # Terminate should handle the broken pipe gracefully
     result = await call_tool("end_session", {"session_id": session_id})
@@ -639,7 +644,7 @@ async def test_cleanup_all_with_dead_sessions() -> None:
     for session_id in session_ids[:2]:
         session = session_manager.get_session(session_id)
         if session:
-            session.kernel.km.shutdown_kernel(now=True)
+            await asyncio.to_thread(session.kernel.km.shutdown_kernel, now=True)
 
     # cleanup_all should handle this gracefully
     await session_manager.cleanup_all()
@@ -661,7 +666,7 @@ async def test_eof_detection() -> None:
 
     # Send a command that will cause the process to exit
     # (good-bye exits ACL2)
-    session.kernel.km.shutdown_kernel(now=True)
+    await asyncio.to_thread(session.kernel.km.shutdown_kernel, now=True)
 
     # Wait a bit for process to exit
     await asyncio.sleep(0.5)
@@ -678,3 +683,129 @@ async def test_eof_detection() -> None:
 
     # Cleanup
     await call_tool("end_session", {"session_id": session_id})
+
+
+@pytest.mark.asyncio
+async def test_include_book_in_session() -> None:
+    """include_book with session_id loads the book into that session's world."""
+    start_result = await call_tool("start_session", {})
+    session_id = start_result[0].text.split("ID: ")[1].strip()
+
+    try:
+        loaded = await call_tool(
+            "include_book",
+            {"file_path": "std/lists/flatten", "session_id": session_id},
+        )
+        assert "INCLUDE-BOOK" in loaded[0].text.upper(), loaded[0].text
+
+        found = await call_tool(
+            "query_event", {"name": "flatten", "session_id": session_id}
+        )
+        assert "FLATTEN" in found[0].text.upper(), found[0].text
+
+        exported = await call_tool(
+            "export_session_code", {"session_id": session_id}
+        )
+        assert 'include-book "std/lists/flatten"' in exported[0].text
+
+        undone = await call_tool(
+            "undo", {"session_id": session_id, "count": 1}
+        )
+        assert "Undone 1 event(s)" in undone[0].text
+
+        gone = await call_tool(
+            "query_event", {"name": "flatten", "session_id": session_id}
+        )
+        assert "not a logical name" in gone[0].text
+
+        pruned = await call_tool(
+            "export_session_code", {"session_id": session_id}
+        )
+        assert 'include-book "std/lists/flatten"' not in pruned[0].text
+    finally:
+        await call_tool("end_session", {"session_id": session_id})
+
+
+@pytest.mark.asyncio
+async def test_check_syntax_in_session_uses_context_and_rolls_back() -> None:
+    """Session checks see session definitions, but leave the world unchanged."""
+    start_result = await call_tool("start_session", {})
+    session_id = start_result[0].text.split("ID: ")[1].strip()
+
+    try:
+        await call_tool(
+            "evaluate",
+            {"code": "(defun ctx-helper (x) x)", "session_id": session_id},
+        )
+
+        checked = await call_tool(
+            "check_syntax",
+            {
+                "code": "(defun ctx-user (x) (ctx-helper x))",
+                "session_id": session_id,
+            },
+        )
+        assert "No syntax errors detected" in checked[0].text
+        assert "rolled back" in checked[0].text
+
+        gone = await call_tool(
+            "query_event", {"name": "ctx-user", "session_id": session_id}
+        )
+        assert "not a logical name" in gone[0].text
+
+        exported = await call_tool(
+            "export_session_code", {"session_id": session_id}
+        )
+        assert "ctx-helper" in exported[0].text
+        assert "ctx-user" not in exported[0].text
+
+        failed = await call_tool(
+            "check_syntax",
+            {
+                "code": "(defthm ctx-impossible (equal 1 2))",
+                "session_id": session_id,
+            },
+        )
+        assert "ACL2 reported errors" in failed[0].text
+
+        incomplete = await call_tool(
+            "check_syntax",
+            {
+                "code": "(defun ctx-broken (x)",
+                "session_id": session_id,
+                "parinfer": False,
+            },
+        )
+        assert "incomplete" in incomplete[0].text
+
+        # The trial executions and reader errors left the session usable.
+        alive = await call_tool(
+            "evaluate", {"code": "(+ 40 2)", "session_id": session_id}
+        )
+        assert "42" in alive[0].text
+    finally:
+        await call_tool("end_session", {"session_id": session_id})
+
+
+@pytest.mark.asyncio
+async def test_state_operations_reject_terminated_session() -> None:
+    """Checkpoint and world-state tools report a dead session clearly."""
+    start_result = await call_tool("start_session", {})
+    session_id = start_result[0].text.split("ID: ")[1].strip()
+
+    try:
+        session = session_manager.get_session(session_id)
+        assert session is not None
+        await asyncio.to_thread(session.kernel.km.shutdown_kernel, now=True)
+        await asyncio.sleep(0.5)
+
+        saved = await call_tool(
+            "save_checkpoint",
+            {"session_id": session_id, "checkpoint_name": "dead"},
+        )
+        assert "terminated" in saved[0].text.lower()
+
+        world = await call_tool("get_world_state", {"session_id": session_id})
+        assert "terminated" in world[0].text.lower()
+    finally:
+        await call_tool("end_session", {"session_id": session_id})

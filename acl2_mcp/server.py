@@ -56,9 +56,13 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=_log_handlers,
 )
-# Jupyter clients are chatty at DEBUG and would flood stderr.
-logging.getLogger("traitlets").setLevel(logging.WARNING)
+# Jupyter clients are chatty at DEBUG and would flood stderr; traitlets also
+# warns about a missing ipykernel ("Native kernel (python3)") on every
+# KernelSpecManager lookup, which does not matter for a non-Python kernel.
+logging.getLogger("traitlets").setLevel(logging.ERROR)
 logging.getLogger("jupyter_client").setLevel(logging.WARNING)
+# asyncio logs a DEBUG line per selector/loop and would bury useful entries.
+logging.getLogger("asyncio").setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 try:
@@ -77,7 +81,6 @@ MAX_CHECKPOINT_NAME_LENGTH = 100  # Maximum checkpoint name length
 MAX_CHECKPOINTS_PER_SESSION = 50  # Maximum checkpoints per session
 MAX_SESSION_NAME_LENGTH = 100  # Maximum session name length
 MAX_EXPORT_LENGTH = 10_000_000  # Maximum accumulated source returned by an export
-DEFAULT_PARINFER_LIB = "/usr/local/lib/libparinfer_rust.so"
 PARINFER_MODES = ("indent", "paren", "smart")
 DEFAULT_PARINFER_MODE = "indent"  # indent mode: derive parens from indentation
 DEFAULT_CHECK_SYNTAX_TIMEOUT = 5
@@ -168,11 +171,11 @@ def validate_file_path(file_path: str) -> Path:
 
     # Check that file exists
     if not abs_path.exists():
-        raise ValueError(f"File not found: {abs_path.name}")
+        raise ValueError(f"File not found: {abs_path}")
 
     # Check that it's a file (not a directory)
     if not abs_path.is_file():
-        raise ValueError(f"Path is not a file: {abs_path.name}")
+        raise ValueError(f"Path is not a file: {abs_path}")
 
     return abs_path
 
@@ -202,11 +205,11 @@ def resolve_book_reference(file_path: str) -> tuple[str, bool]:
             continue
         if resolved.exists():
             if not resolved.is_file():
-                raise ValueError(f"Path is not a file: {resolved.name}")
+                raise ValueError(f"Path is not a file: {resolved}")
             return str(resolved.with_suffix("")), True
 
     if path.is_absolute():
-        raise ValueError(f"File not found: {path.name}")
+        raise ValueError(f"File not found: {path}")
 
     # Not a local file: let ACL2 look in its system book directory.
     return raw, False
@@ -233,10 +236,10 @@ def validate_output_path(file_path: str, overwrite: bool = False) -> Path:
 
     if abs_path.exists():
         if abs_path.is_dir():
-            raise ValueError(f"Path is a directory: {abs_path.name}")
+            raise ValueError(f"Path is a directory: {abs_path}")
         if not overwrite:
             raise ValueError(
-                f"File already exists: {abs_path.name} (set overwrite=true to replace it)"
+                f"File already exists: {abs_path} (set overwrite=true to replace it)"
             )
 
     if not abs_path.parent.is_dir():
@@ -269,15 +272,15 @@ def read_source_argument(arguments: Any) -> tuple[str, Optional[Path]]:
         try:
             code = abs_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            raise ValueError(f"File is not valid UTF-8: {abs_path.name}")
+            raise ValueError(f"File is not valid UTF-8: {abs_path}")
         except OSError as e:
-            raise ValueError(f"Could not read {abs_path.name}: {e}")
+            raise ValueError(f"Could not read {abs_path}: {e}")
         if len(code) > MAX_CODE_LENGTH:
             raise ValueError(
                 f"Source exceeds maximum length of {MAX_CODE_LENGTH} characters"
             )
         if not code.strip():
-            raise ValueError(f"File is empty: {abs_path.name}")
+            raise ValueError(f"File is empty: {abs_path}")
         return code, abs_path
 
     if not isinstance(code, str):
@@ -348,9 +351,10 @@ def write_balanced_source(destination: Path, source: str) -> str:
     try:
         destination.write_text(text, encoding="utf-8")
     except OSError as e:
-        raise ValueError(f"Could not write {destination.name}: {e}")
+        raise ValueError(f"Could not write {destination}: {e}")
+    line_count = len(text.splitlines())
     return (
-        f"Wrote {len(text.splitlines())} lines "
+        f"Wrote {line_count} {'line' if line_count == 1 else 'lines'} "
         f"({len(text)} characters) to {destination}."
     )
 
@@ -371,7 +375,24 @@ def _load_parinfer_lib() -> Optional[ctypes.CDLL]:
         if _parinfer_lib_error is not None:
             return None
 
-        lib_path = os.environ.get("PARINFER_LIB", DEFAULT_PARINFER_LIB)
+        from .provision import find_parinfer_library
+
+        library = find_parinfer_library()
+        if library is None:
+            explicit = os.environ.get("PARINFER_LIB")
+            if explicit:
+                _parinfer_lib_error = (
+                    f"could not find the parinfer library at PARINFER_LIB={explicit}"
+                )
+            else:
+                _parinfer_lib_error = (
+                    "could not find libparinfer_rust; reinstall acl2-mcp with a "
+                    "Rust toolchain, or set PARINFER_LIB to an existing library"
+                )
+            logger.warning(_parinfer_lib_error)
+            return None
+
+        lib_path = str(library)
         try:
             lib = ctypes.CDLL(lib_path)
             lib.run_parinfer.restype = ctypes.c_char_p
@@ -458,19 +479,26 @@ async def balance_if_enabled(
 
 
 _ACL2_FAILURE_MARKERS = (
-    "ACL2 Error",
     "ACL2 Halted",
     "HARD ACL2 ERROR",
     "ABORTING from raw Lisp",
     "******** FAILED ********",
+)
+# ACL2 prints "ACL2 Error in ..." or "ACL2 Error [Failure] in ..." at the start
+# of a line, and "ACL2 Error: ..." when no context is supplied.  Do not match
+# a bare "ACL2 Error": user output (cw) can contain that exact text.
+_ACL2_ERROR_RE = re.compile(
+    r"(?m)^[ \t]*ACL2 Error(?::|\s*(?:\[[^\]]*\]\s*)?in\b)"
 )
 
 
 def acl2_output_failed(output: str) -> bool:
     """Whether ACL2 output indicates the submission was not accepted."""
     # Server-generated failures ("Error: ...") may follow a parinfer note, so
-    # look for them at the start of any line, not just at the start of output.
+    # look for them at the start of any line, not just the start of output.
     if any(line.startswith("Error: ") for line in output.splitlines()):
+        return True
+    if _ACL2_ERROR_RE.search(output):
         return True
     return any(marker in output for marker in _ACL2_FAILURE_MARKERS)
 
@@ -516,12 +544,24 @@ def clean_acl2_output(output: str) -> str:
     return "\n".join(lines)
 
 
+def strip_leading_acl2_result(output: str) -> str:
+    """Drop a leading ``"ACL2"`` package result left by an ``ld`` form."""
+    lines = output.splitlines()
+    if lines and lines[0].strip() == '"ACL2"':
+        lines.pop(0)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        return "\n".join(lines)
+    return output
+
+
 def parinfer_unavailable_note(enabled: bool) -> str:
     """A visible note when balancing was requested but cannot be performed."""
     if enabled and not parinfer_available():
         return (
             "[parinfer unavailable; code submitted unchanged. "
-            "Set PARINFER_LIB to enable balancing.]\n\n"
+            "Reinstall with a Rust toolchain or set PARINFER_LIB to enable "
+            "balancing.]\n\n"
         )
     return ""
 
@@ -716,6 +756,21 @@ class ACL2Session:
                 text = f"Error: {ename}: {evalue}".rstrip(": ")
             return text
 
+    async def is_complete(self, code: str, timeout: int = 10) -> str:
+        """Ask the session kernel whether CODE is complete without running it."""
+        async with self.lock:
+            self.last_activity = time.time()
+            if not self.is_alive():
+                self.alive = False
+                raise KernelDied("Session process has terminated")
+            try:
+                return await asyncio.to_thread(self.kernel.is_complete, code, timeout)
+            except KernelTimeout:
+                # The kernel is stopped by is_complete on a timeout, so the
+                # session cannot be used afterwards.
+                self.alive = False
+                raise
+
     def record_accepted(self, code: str, event_number: int) -> None:
         """Record source that created event(s), up to the export size cap."""
         if self.accepted_code_size + len(code) > MAX_EXPORT_LENGTH:
@@ -736,6 +791,41 @@ class ACL2Session:
             logger.debug(
                 f"Session {self.session_id}: kernel shutdown failed", exc_info=True
             )
+
+
+def accepted_submission_source(
+    session: ACL2Session, code: str, output: str, before: int
+) -> Optional[str]:
+    """Return the source to record for a submission, or None if none was kept.
+
+    ACL2 continues reading a cell after a failed event, so a submission can add
+    events and still report an error (for example a defun followed by a false
+    defthm).  The kernel's event metadata lists exactly the forms that were
+    accepted; record those rather than dropping the whole partial submission.
+    An include-book expands into its book's embedded events, so on a partial
+    failure only the submitted load form is recorded.
+    """
+    if session.event_counter <= before:
+        return None
+    if not acl2_output_failed(output):
+        return code
+
+    cell = session.last_cell
+    if cell is None or not cell.forms:
+        return None
+    forms = list(reversed(cell.forms))
+    if any(re.match(r"\(\s*include-book\b", form, re.IGNORECASE) for form in forms):
+        # The forms are the book's expansion, not the submitted source.  Keep
+        # the submitted include-book load (the failing extra code is dropped).
+        for line in code.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if re.match(r"\(\s*include-book\b", stripped, re.IGNORECASE):
+                return stripped
+            break
+        return None
+    return "\n\n".join(form.rstrip() for form in forms)
 
 
 def resolve_parinfer(arguments: Any, session: Optional[ACL2Session]) -> tuple[bool, str]:
@@ -941,6 +1031,18 @@ class SessionManager:
 session_manager = SessionManager()
 
 
+def terminated_session_error(session_id: str) -> list[TextContent]:
+    """A clear error for a session whose kernel has exited."""
+    return [
+        TextContent(
+            type="text",
+            text=(
+                f"Error: Session {session_id} has terminated; start a new session."
+            ),
+        )
+    ]
+
+
 async def list_tools() -> list[Tool]:
     """List available ACL2 tools."""
     return [
@@ -1052,7 +1154,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="check_syntax",
-            description="Check ACL2 code for reader/syntax errors. Input is either inline code or an input_path file. By default the code is first balanced with parinfer (indent mode), so mismatched parens may be silently repaired; pass parinfer=false to validate the literal source. The kernel then reports reader completeness directly: incomplete or invalid text is a syntax error and is not executed, while readable code is run for a bounded time and admission failures are reported separately. On success, return the balanced source, write it to a different file (output_path/file_path), or rewrite the input file in place (in_place). Use 'admit' or 'prove' to establish that events are accepted.",
+            description="Check ACL2 code for reader/syntax errors and, for readable code, run it once to report admission failures. Input is either inline code or an input_path file. By default the code is first balanced with parinfer (indent mode), so mismatched parens may be silently repaired; pass parinfer=false to validate the literal source. The kernel reports reader completeness directly: incomplete or invalid text is a syntax error and is not executed. Readable code is executed for a bounded time; with session_id it runs in that session's context and any events it adds are rolled back (like admit), and without a session it runs in a throwaway kernel. On success, return the balanced source, write it to a different file (output_path/file_path), or rewrite the input file in place (in_place). Use 'admit' or 'prove' to establish that events are accepted.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -1063,6 +1165,10 @@ async def list_tools() -> list[Tool]:
                     "input_path": {
                         "type": "string",
                         "description": "Read the code from this file instead of passing code in the call",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional: ID of a persistent session. Readable code is checked in that session's context; events it adds are rolled back.",
                     },
                     "parinfer": {
                         "type": "boolean",
@@ -1121,17 +1227,21 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="include_book",
-            description="Load a certified ACL2 book to use its definitions and theorems. Use this to import existing ACL2 libraries before proving new theorems. Optionally run additional code after loading. A local book path (with or without .lisp) is used directly; any other name is resolved against ACL2's system book directory. IMPORTANT: Provide path WITHOUT .lisp extension.",
+            description="Load a certified ACL2 book to use its definitions and theorems. Use this to import existing ACL2 libraries before proving new theorems. Optionally run additional code after loading. A local book path (with or without .lisp) is used directly; any other name is resolved against ACL2's system book directory. Pass session_id to load the book into a persistent session's world and record it for export; without a session a fresh ACL2 kernel is used and discarded.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Path to the book WITHOUT .lisp extension. Example: 'std/lists/append' for ACL2 standard library",
+                        "description": "Path to the book, normally WITHOUT the .lisp extension (a trailing .lisp is also accepted). Example: 'std/lists/append' for ACL2 standard library",
                     },
                     "code": {
                         "type": "string",
                         "description": "Optional ACL2 code to run after loading the book. Example: (thm (equal (+ 1 1) 2))",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional: ID of a persistent session. Load the book into that session's world instead of a fresh kernel.",
                     },
                     "parinfer": {
                         "type": "boolean",
@@ -1265,7 +1375,7 @@ async def list_tools() -> list[Tool]:
                         "description": "ID of the session to undo in",
                     },
                     "count": {
-                        "type": "number",
+                        "type": "integer",
                         "description": "Number of events to undo (default: 1)",
                         "default": 1,
                     },
@@ -1320,7 +1430,7 @@ async def list_tools() -> list[Tool]:
                         "description": "ID of the session",
                     },
                     "limit": {
-                        "type": "number",
+                        "type": "integer",
                         "description": "Maximum number of recent events to show (default: 20)",
                         "default": 20,
                     },
@@ -1407,7 +1517,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="export_session_code",
-            description="Export the source of events accepted into a persistent session that are still in its current world. This is a server-tracked submission log, not a full world dump: non-event evaluations are skipped, forms removed by undo/checkpoint restore are pruned, and events added outside these tools (for example by an included book) are not recovered. A submission that added several events is tracked as one unit, so undoing part of it drops the whole recorded form. Without file_path, returns the source text. With file_path, writes the source to that file and returns only a confirmation with the path, line count, and character count.",
+            description="Export the source of events accepted into a persistent session that are still in its current world. This is a server-tracked submission log, not a full world dump: non-event evaluations are skipped, forms removed by undo/checkpoint restore are pruned, and events added outside these tools (for example by an included book) are not recovered. A submission that added several events is tracked as one unit, so undoing part of it drops the whole recorded form; if a multi-form submission partly fails, only the forms the kernel reports as accepted are recorded. Without file_path, returns the source text. With file_path, writes the source to that file and returns only a confirmation with the path, line count, and character count.",
             input_schema={
                 "type": "object",
                 "properties": {
@@ -1491,14 +1601,24 @@ async def certify_acl2_book(file_path: str, timeout: int = 120) -> str:
     Returns:
         Output from ACL2
     """
-    # Remove .lisp extension if present
-    book_path = str(Path(file_path).with_suffix(""))
-    lisp_path = Path(book_path).with_suffix(".lisp")
+    # Only a trailing .lisp is an extension here.  Path.with_suffix("") would
+    # also strip a dot that belongs to the book name ("my.book.lisp" would be
+    # looked up as "my.lisp").
+    if file_path.lower().endswith(".lisp"):
+        lisp_path = Path(file_path)
+    else:
+        lisp_path = Path(f"{file_path}.lisp")
 
     try:
         abs_path = validate_file_path(str(lisp_path))
     except ValueError as e:
         return f"Error: {e}"
+
+    book_path = (
+        str(abs_path)[: -len(".lisp")]
+        if str(abs_path).lower().endswith(".lisp")
+        else str(abs_path)
+    )
 
     # Get the directory and check for .acl2 files
     book_dir = str(Path(abs_path).parent)
@@ -1539,7 +1659,39 @@ async def certify_acl2_book(file_path: str, timeout: int = 120) -> str:
     
     logger.info(f"CERTIFY_BOOK: code={code}, cwd={book_dir}")
     # Run from book's directory so .acl2 file's relative paths work
-    return await run_acl2(code, timeout, cwd=book_dir)
+    return strip_leading_acl2_result(
+        await run_acl2(code, timeout, cwd=book_dir)
+    )
+
+
+def build_include_book_code(file_path: str, additional_code: str = "") -> str:
+    """
+    Build the ACL2 code that loads a book (and optional extra code).
+
+    Raises:
+        ValueError: If the book path is invalid or the extra code is too long
+    """
+    # Resolve the book reference: a local file becomes an absolute path;
+    # anything else is left for ACL2 to find among its system books.
+    book_ref, is_local = resolve_book_reference(file_path)
+
+    # Escape the book path for safe use in ACL2 code
+    escaped_book_path = escape_acl2_string(book_ref)
+
+    # Build code to include book and run additional commands
+    if is_local:
+        code = f'(include-book "{escaped_book_path}")'
+    else:
+        code = f'(include-book "{escaped_book_path}" :dir :system)'
+    if additional_code.strip():
+        # Validate additional code length
+        if len(additional_code) > MAX_CODE_LENGTH:
+            raise ValueError(
+                "Additional code exceeds maximum length of "
+                f"{MAX_CODE_LENGTH} characters"
+            )
+        code += f"\n{additional_code}"
+    return code
 
 
 async def include_acl2_book(file_path: str, additional_code: str = "", timeout: int = 60) -> str:
@@ -1554,26 +1706,10 @@ async def include_acl2_book(file_path: str, additional_code: str = "", timeout: 
     Returns:
         Output from ACL2
     """
-    # Resolve the book reference: a local file becomes an absolute path;
-    # anything else is left for ACL2 to find among its system books.
     try:
-        book_ref, is_local = resolve_book_reference(file_path)
+        code = build_include_book_code(file_path, additional_code)
     except ValueError as e:
         return f"Error: {e}"
-
-    # Escape the book path for safe use in ACL2 code
-    escaped_book_path = escape_acl2_string(book_ref)
-
-    # Build code to include book and run additional commands
-    if is_local:
-        code = f'(include-book "{escaped_book_path}")'
-    else:
-        code = f'(include-book "{escaped_book_path}" :dir :system)'
-    if additional_code.strip():
-        # Validate additional code length
-        if len(additional_code) > MAX_CODE_LENGTH:
-            return f"Error: Additional code exceeds maximum length of {MAX_CODE_LENGTH} characters"
-        code += f"\n{additional_code}"
 
     return await run_acl2(code, timeout)
 
@@ -1612,7 +1748,7 @@ async def query_acl2_event(name: str, file_path: str = "", timeout: int = 30) ->
     # Use :pe (print event) to show the definition
     code += f":pe {validated_name}"
 
-    return await run_acl2(code, timeout, cwd=cwd)
+    return strip_leading_acl2_result(await run_acl2(code, timeout, cwd=cwd))
 
 
 async def verify_function_guards(function_name: str, file_path: str = "", timeout: int = 60) -> str:
@@ -1649,7 +1785,7 @@ async def verify_function_guards(function_name: str, file_path: str = "", timeou
     # Use verify-guards command
     code += f"(verify-guards {validated_name})"
 
-    return await run_acl2(code, timeout, cwd=cwd)
+    return strip_leading_acl2_result(await run_acl2(code, timeout, cwd=cwd))
 
 
 async def handle_list_tools(_ctx: Any, _params: Any) -> ListToolsResult:
@@ -1671,7 +1807,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         if session_id and bool(parinfer_enabled) and not parinfer_available():
             message += (
                 "\nWarning: parinfer library unavailable; submissions will not be "
-                "balanced. Set PARINFER_LIB to the parinfer-rust shared library."
+                "balanced. Reinstall with a Rust toolchain or set PARINFER_LIB."
             )
         return [
             TextContent(
@@ -1722,6 +1858,8 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                     text=f"Error: Session {session_id} not found",
                 )
             ]
+        if not session.is_alive():
+            return terminated_session_error(session_id)
 
         # :ubt n undoes the commands from the most recent one back through n.
         # To remove `count` events ending at the current event E we must target
@@ -1792,6 +1930,8 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                     text=f"Error: Session {session_id} not found",
                 )
             ]
+        if not session.is_alive():
+            return terminated_session_error(session_id)
 
         # SECURITY: Limit number of checkpoints per session
         if len(session.checkpoints) >= MAX_CHECKPOINTS_PER_SESSION:
@@ -1839,6 +1979,8 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                     text=f"Error: Session {session_id} not found",
                 )
             ]
+        if not session.is_alive():
+            return terminated_session_error(session_id)
 
         checkpoint: Optional[SessionCheckpoint] = session.checkpoints.get(checkpoint_name)
         if checkpoint is None:
@@ -1925,6 +2067,8 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                     text=f"Error: Session {session_id} not found",
                 )
             ]
+        if not session.is_alive():
+            return terminated_session_error(session_id)
 
         # Show the recent command forms.  get-command-sequence returns the
         # source of commands start..end (relative command numbers), which is
@@ -1974,6 +2118,8 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                     text=f"Error: Session {session_id} not found",
                 )
             ]
+        if not session.is_alive():
+            return terminated_session_error(session_id)
 
         use_parinfer, parinfer_mode = resolve_parinfer(arguments, session)
         balanced, parinfer_error = await balance_if_enabled(
@@ -1990,8 +2136,9 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
 
         before = session.event_counter
         output = await session.send_command(balanced, timeout)
-        if not acl2_output_failed(output) and session.event_counter > before:
-            session.record_accepted(balanced, session.event_counter)
+        accepted = accepted_submission_source(session, balanced, output, before)
+        if accepted is not None:
+            session.record_accepted(accepted, session.event_counter)
 
         note = parinfer_unavailable_note(use_parinfer)
         if balanced != code:
@@ -2027,6 +2174,8 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                         text=f"Error: Session {session_id} not found",
                     )
                 ]
+            if not session.is_alive():
+                return terminated_session_error(session_id)
 
         use_parinfer, parinfer_mode = resolve_parinfer(arguments, session)
         balanced, parinfer_error = await balance_if_enabled(code, use_parinfer, parinfer_mode)
@@ -2042,8 +2191,9 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         if session is not None:
             before = session.event_counter
             output = await session.send_command(balanced, timeout)
-            if not acl2_output_failed(output) and session.event_counter > before:
-                session.record_accepted(balanced, session.event_counter)
+            accepted = accepted_submission_source(session, balanced, output, before)
+            if accepted is not None:
+                session.record_accepted(accepted, session.event_counter)
         else:
             output = await run_acl2(balanced, timeout)
 
@@ -2081,6 +2231,8 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                         text=f"Error: Session {session_id} not found",
                     )
                 ]
+            if not session.is_alive():
+                return terminated_session_error(session_id)
 
         use_parinfer, parinfer_mode = resolve_parinfer(arguments, session)
         balanced, parinfer_error = await balance_if_enabled(code, use_parinfer, parinfer_mode)
@@ -2096,8 +2248,9 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         if session is not None:
             before = session.event_counter
             output = await session.send_command(balanced, timeout)
-            if not acl2_output_failed(output) and session.event_counter > before:
-                session.record_accepted(balanced, session.event_counter)
+            accepted = accepted_submission_source(session, balanced, output, before)
+            if accepted is not None:
+                session.record_accepted(accepted, session.event_counter)
         else:
             output = await run_acl2(balanced, timeout)
 
@@ -2138,6 +2291,20 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
+        session_id = arguments.get("session_id")
+        session = None
+        if session_id:
+            session = session_manager.get_session(session_id)
+            if not session:
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Error: Session {session_id} not found",
+                    )
+                ]
+            if not session.is_alive():
+                return terminated_session_error(session_id)
+
         # Balance first (indent mode): LLM-written code tends to have good
         # indentation but missing/extra parens. The syntax check then runs on
         # the balanced source, which is what gets returned or written.
@@ -2154,11 +2321,53 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             ]
 
         # The kernel answers reader completeness directly, so unbalanced input
-        # is rejected without executing anything (and without hanging).
+        # is rejected without executing anything (and without hanging).  In a
+        # session, readable code is run in the session's context and any events
+        # it adds are rolled back, like admit.
+        rolled_back = False
         try:
-            syntax_status, cell = await asyncio.to_thread(
-                check_syntax_once, balanced, timeout
-            )
+            if session is not None:
+                syntax_status = await session.is_complete(balanced, timeout)
+                output = ""
+                if syntax_status == "complete":
+                    before = session.event_counter
+                    output = await session.send_command(balanced, timeout)
+                    if not session.is_alive():
+                        return [TextContent(type="text", text=output)]
+                    if session.event_counter < before:
+                        return [
+                            TextContent(
+                                type="text",
+                                text=(
+                                    "Error: The checked code removed events from "
+                                    "the session; it cannot be rolled back. Use "
+                                    "undo/restore explicitly if that was "
+                                    "intended.\n\n"
+                                    f"{output}"
+                                ),
+                            )
+                        ]
+                    if session.event_counter > before:
+                        undo_output = await session.send_command(
+                            f":ubt {before + 1}", timeout
+                        )
+                        if acl2_output_failed(undo_output):
+                            return [
+                                TextContent(
+                                    type="text",
+                                    text=(
+                                        "Error: Syntax check ran but the test "
+                                        "event(s) could not be rolled back:\n\n"
+                                        f"{undo_output}"
+                                    ),
+                                )
+                            ]
+                        rolled_back = True
+            else:
+                syntax_status, cell = await asyncio.to_thread(
+                    check_syntax_once, balanced, timeout
+                )
+                output = clean_acl2_output(cell.text) if cell is not None else ""
         except KernelTimeout:
             return [
                 TextContent(
@@ -2208,18 +2417,23 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        output = clean_acl2_output(cell.text) if cell is not None else ""
-
         notes = parinfer_unavailable_note(bool(use_parinfer))
         if balanced != code:
             notes += "[parinfer adjusted the code]\n\n"
 
         execution_failed = acl2_output_failed(output)
+        if session is not None and rolled_back:
+            execution_note = " (executed in the session; added events rolled back)"
+        elif session is not None:
+            execution_note = " (executed in the session)"
+        else:
+            execution_note = " (executed in a throwaway kernel)"
         if execution_failed:
             status = (
-                f"No syntax errors detected{source_note}, but ACL2 reported errors "
-                "while executing the balanced source. Review the output before "
-                "relying on the code; use admit/prove for acceptance.\n\n"
+                f"No syntax errors detected{source_note}{execution_note}, but ACL2 "
+                "reported errors while executing the balanced source. Review the "
+                "output before relying on the code; use admit/prove for "
+                "acceptance.\n\n"
             )
         elif not output.strip():
             status = (
@@ -2227,7 +2441,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 "output.\n\n"
             )
         else:
-            status = f"No syntax errors detected{source_note}.\n\n"
+            status = f"No syntax errors detected{source_note}{execution_note}.\n\n"
 
         if destination is not None:
             try:
@@ -2239,14 +2453,24 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                         text=f"Error: {e}",
                     )
                 ]
+            # Keep the diagnosis visible when the file was written anyway:
+            # "review the output" is meaningless if the output is dropped.
+            details = f"{status}{output}" if execution_failed else ""
             return [
                 TextContent(
                     type="text",
-                    text=confirmation + notes + (status if execution_failed else ""),
+                    text=f"{confirmation}\n\n{notes}{details}".rstrip() + "\n",
                 )
             ]
 
         if return_source:
+            if execution_failed:
+                return [
+                    TextContent(
+                        type="text",
+                        text=notes + status + output,
+                    )
+                ]
             return [
                 TextContent(
                     type="text",
@@ -2277,8 +2501,22 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
     elif name == "include_book":
         file_path = arguments["file_path"]
         additional_code = arguments.get("code", "")
+        session_id = arguments.get("session_id")
         timeout = arguments.get("timeout", 60)
         use_parinfer = bool(arguments.get("parinfer", True))
+
+        session = None
+        if session_id:
+            session = session_manager.get_session(session_id)
+            if not session:
+                return [
+                    TextContent(
+                        type="text",
+                        text=f"Error: Session {session_id} not found",
+                    )
+                ]
+            if not session.is_alive():
+                return terminated_session_error(session_id)
 
         balanced, parinfer_error = await balance_if_enabled(
             additional_code, use_parinfer, DEFAULT_PARINFER_MODE
@@ -2292,7 +2530,24 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 )
             ]
 
-        output = await include_acl2_book(file_path, balanced, timeout)
+        try:
+            code = build_include_book_code(file_path, balanced)
+        except ValueError as e:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: {e}",
+                )
+            ]
+
+        if session is not None:
+            before = session.event_counter
+            output = await session.send_command(code, timeout)
+            accepted = accepted_submission_source(session, code, output, before)
+            if accepted is not None:
+                session.record_accepted(accepted, session.event_counter)
+        else:
+            output = await run_acl2(code, timeout)
 
         note = parinfer_unavailable_note(
             use_parinfer and bool(additional_code.strip())
@@ -2384,8 +2639,9 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                     type="text",
                     text=(
                         f"Error: No event named '{validated_theorem}' was introduced "
-                        f"by {abs_path}. The name may be misspelled, or an earlier "
-                        "form in the file may have failed to admit. Load output:\n\n"
+                        f"by {abs_path}. The name may be misspelled, or the named "
+                        "event (or an earlier form) may have failed to admit. "
+                        "Load output:\n\n"
                         f"{load_output}"
                     ),
                 )
@@ -2398,7 +2654,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                     type="text",
                     text=(
                         f"Error: Could not undo the event '{validated_theorem}' "
-                        f"(it may come from an included book rather than {abs_path.name}).\n\n"
+                        f"(it may come from an included book rather than {abs_path}).\n\n"
                         f"{undo_detail}"
                     ),
                 )
@@ -2418,6 +2674,8 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         # On a clean load, return just the re-proof; otherwise keep the load
         # transcript so its errors are visible.
         body = cleaned if load_failed else reproof_output.strip()
+        # The generated driver evaluates to NIL after the re-proof; it is noise.
+        body = re.sub(r"(?mi)\n[ \t]*nil[ \t]*$", "", body)
         return [
             TextContent(
                 type="text",
@@ -2449,6 +2707,8 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                         text=f"Error: Session {session_id} not found",
                     )
                 ]
+            if not session.is_alive():
+                return terminated_session_error(session_id)
 
         use_parinfer, parinfer_mode = resolve_parinfer(arguments, session)
         balanced, parinfer_error = await balance_if_enabled(code, use_parinfer, parinfer_mode)
@@ -2466,6 +2726,19 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             before = session.event_counter
             output = await session.send_command(balanced, timeout)
             success = not acl2_output_failed(output)
+
+            if session.event_counter < before:
+                return [
+                    TextContent(
+                        type="text",
+                        text=(
+                            "Error: Admit ran a command that removed events from "
+                            "the session; it cannot be rolled back. Use undo/"
+                            "restore explicitly if that was intended.\n\n"
+                            f"{output}"
+                        ),
+                    )
+                ]
 
             # admit is a test: undo any events the submission managed to add,
             # whether it succeeded or failed part-way through.
@@ -2522,6 +2795,8 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                         text=f"Error: Session {session_id} not found",
                     )
                 ]
+            if not session.is_alive():
+                return terminated_session_error(session_id)
             try:
                 validated_name = validate_acl2_identifier(name_arg)
             except ValueError as e:
@@ -2535,10 +2810,14 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
         else:
             output = await query_acl2_event(name_arg, file_path, timeout)
 
+        if output.lstrip().startswith("Error:"):
+            text_out = output
+        else:
+            text_out = f"Event information for {name_arg}:\n\n{output}"
         return [
             TextContent(
                 type="text",
-                text=output,
+                text=text_out,
             )
         ]
 
@@ -2564,6 +2843,8 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                         text=f"Error: Session {session_id} not found",
                     )
                 ]
+            if not session.is_alive():
+                return terminated_session_error(session_id)
             try:
                 validated_name = validate_acl2_identifier(function_name)
             except ValueError as e:
@@ -2624,7 +2905,8 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 TextContent(
                     type="text",
                     text=f"Error: {_parinfer_lib_error or 'parinfer library unavailable'}\n"
-                    "Set PARINFER_LIB to the parinfer-rust shared library path.",
+                    "Reinstall with a Rust toolchain or set PARINFER_LIB to the "
+                    "parinfer-rust shared library path.",
                 )
             ]
 
@@ -2702,7 +2984,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 return [
                     TextContent(
                         type="text",
-                        text=f"Error: could not write {out_path.name}: {e}",
+                        text=f"Error: could not write {out_path}: {e}",
                     )
                 ]
 
@@ -2733,7 +3015,28 @@ async def handle_call_tool(_ctx: Any, params: Any) -> CallToolResult:
     message instead of a protocol failure.
     """
     try:
-        content = await call_tool(params.name, params.arguments or {})
+        arguments = params.arguments or {}
+        tools = {tool.name: tool for tool in await list_tools()}
+        tool = tools.get(params.name)
+        if tool is not None and isinstance(arguments, dict):
+            schema = tool.input_schema or {}
+            allowed = set(schema.get("properties", {}))
+            unknown = sorted(set(arguments) - allowed)
+            if unknown:
+                return CallToolResult(
+                    content=[
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"Error: Unknown argument(s) for {params.name}: "
+                                f"{', '.join(unknown)}. Allowed: "
+                                f"{', '.join(sorted(allowed))}"
+                            ),
+                        )
+                    ],
+                    is_error=True,
+                )
+        content = await call_tool(params.name, arguments)
     except ValueError as e:
         return CallToolResult(
             content=[TextContent(type="text", text=f"Error: {e}")],
@@ -2794,6 +3097,18 @@ app: Server = Server(
 
 async def run() -> None:
     """Run the server."""
+    # Make a parinfer library and the kernelspec available if pip did not get
+    # a chance to (for example in an editable install).
+    from .provision import ensure_kernelspec, ensure_parinfer
+
+    await asyncio.to_thread(ensure_parinfer)
+    if not (
+        os.environ.get("ACL2_MCP_KERNEL") or os.environ.get("ACL2_MCP_KERNEL_NAME")
+    ):
+        try:
+            await asyncio.to_thread(ensure_kernelspec, resolve_kernel_name())
+        except Exception as exc:
+            logger.warning("Could not prepare the ACL2 kernelspec: %s", exc)
     try:
         async with stdio_server() as (read_stream, write_stream):
             await app.run(

@@ -11,9 +11,27 @@ from acl2_mcp.server import (
     validate_acl2_identifier,
     escape_acl2_string,
     validate_file_path,
+    validate_output_path,
+    acl2_output_failed,
     call_tool,
     handle_call_tool,
 )
+
+
+def test_acl2_output_failed_recognizes_error_headers() -> None:
+    """ACL2's error headers are failures."""
+    assert acl2_output_failed("ACL2 Error in ( DEFUN U ...): boom")
+    assert acl2_output_failed("ACL2 Error [Failure] in ( DEFTHM T ...): no")
+    assert acl2_output_failed("  ACL2 Error: no context")
+    assert acl2_output_failed("******** FAILED ********")
+    assert acl2_output_failed("HARD ACL2 ERROR in FOO")
+
+
+def test_acl2_output_failed_ignores_user_text() -> None:
+    """Output containing the words, but not an ACL2 error header, is a success."""
+    assert not acl2_output_failed("ACL2 Error")
+    assert not acl2_output_failed("nil\nACL2 Error\n")
+    assert not acl2_output_failed("The ACL2 Error messages are documented.")
 
 
 def test_validate_timeout_clamps_max() -> None:
@@ -148,6 +166,34 @@ async def test_start_session_missing_acl2_is_a_tool_error(
 
     assert len(result) == 1
     assert "Could not start ACL2 executable" in result[0].text
+
+
+def test_validate_file_path_reports_the_full_path(tmp_path: Path) -> None:
+    missing = tmp_path / "nested" / "missing.lisp"
+    with pytest.raises(ValueError) as excinfo:
+        validate_file_path(str(missing))
+    assert str(missing) in str(excinfo.value)
+
+
+def test_validate_output_path_reports_the_full_path(tmp_path: Path) -> None:
+    existing = tmp_path / "existing.lisp"
+    existing.write_text("(+ 1 1)\n", encoding="utf-8")
+    with pytest.raises(ValueError) as excinfo:
+        validate_output_path(str(existing))
+    assert str(existing) in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_unknown_argument_is_rejected() -> None:
+    """A misspelled argument must not be silently ignored."""
+    result = await handle_call_tool(
+        None,
+        SimpleNamespace(name="list_sessions", arguments={"sessionid": "typo"}),
+    )
+    assert result.is_error
+    text = "".join(block.text for block in result.content)
+    assert "Unknown argument" in text
+    assert "sessionid" in text
 
 
 @pytest.mark.asyncio
